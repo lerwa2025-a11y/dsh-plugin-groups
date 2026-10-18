@@ -1,0 +1,40 @@
+{
+  "name": "dsh-plugin-groups",
+  "version": "0.1.0",
+  "description": "DSH 插件分组视图：在「已安装插件」页新增分组/标签/备注/锁定标签页",
+  "type": "module",
+  "license": "MIT",
+  "author": "lerwa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lerwa2025-a11y/dsh-plugin-groups.git"
+  },
+  "homepage": "https://github.com/lerwa2025-a11y/dsh-plugin-groups#readme",
+  "bugs": {
+    "url": "https://github.com/lerwa2025-a11y/dsh-plugin-groups/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "cordis",
+    "plugin-manager",
+    "groups"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-settings-plugins"]
+    }
+  }
+}

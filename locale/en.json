@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Groups View",
+    "description": "Adds a tab beside Installed plugins that lists plugins by custom groups and order, reflecting real enablement state."
+  }
+}

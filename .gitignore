@@ -1,0 +1,5 @@
+# 个人设置文件，不随仓库公开
+plugin-groups.json
+
+# 依赖目录
+node_modules/
