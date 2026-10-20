@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * Build stamp shown in the toolbar. Bump this whenever the Client half
      * changes so a stale page can be recognised immediately.
      */
-    const BUILD = '2026-10-20.02';
+    const BUILD = '2026-10-20.03';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must

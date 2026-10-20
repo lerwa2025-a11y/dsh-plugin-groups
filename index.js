@@ -10,24 +10,73 @@
  * The route is mounted only when the Web server service is present, so a
  * headless composition stays unaffected.
  */
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 
 const ROUTE_PATH = '/plugin-groups/layout';
 const FILE_NAME = 'plugin-groups.json';
+
+/** Own data folder under DSH_HOME, the convention every other plugin follows. */
+const DATA_DIR_NAME = 'dsh-plugin-groups';
 
 const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {}, presets: {} };
 
 /** Fixed preset slots; the ids never change, the labels are the user's. */
 const PRESET_SLOTS = ['p1', 'p2'];
 
-/** Directory holding the layout: the booted profile, else the process cwd. */
-function profileDir() {
-  return process.env.DSH_PROFILE_DIR ?? process.cwd();
+/** DSH home: the same resolution the official plugins use ($DSH_HOME, else ~/.dsh). */
+function dshHome() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh');
+}
+
+/**
+ * Directory holding the layout: this plugin's own folder under DSH_HOME.
+ *
+ * Deliberately NOT inside the package directory. The package lives in
+ * node_modules and pnpm replaces it wholesale on every update, so data kept
+ * there would be destroyed by an upgrade. DSH_HOME is data, node_modules is
+ * code: keeping them apart is what makes updating safe.
+ *
+ * Removing the plugin leaves this folder behind (DSH never deletes plugin
+ * data), so uninstalling truly means "delete this one folder" when the data
+ * should go too.
+ */
+function dataDir() {
+  return join(dshHome(), DATA_DIR_NAME);
 }
 
 function statePath() {
-  return join(profileDir(), FILE_NAME);
+  return join(dataDir(), FILE_NAME);
+}
+
+/** The pre-0.2.1 location (profile root), used only for a one-time migration. */
+function legacyStatePath() {
+  const profile = process.env.DSH_PROFILE_DIR;
+  return profile === undefined ? null : join(profile, FILE_NAME);
+}
+
+async function exists(file) {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Move a layout saved by an older build into the new data folder.
+ *
+ * Only runs when the new file is absent and the old one is present, so it can
+ * never overwrite user data, and it is a no-op on every later start.
+ */
+async function migrateLegacyLayout() {
+  const target = statePath();
+  const legacy = legacyStatePath();
+  if (legacy === null || await exists(target) || !await exists(legacy)) return;
+  await mkdir(dirname(target), { recursive: true });
+  await rename(legacy, target);
 }
 
 /** Coerce an untrusted value into the layout shape. */
@@ -165,6 +214,7 @@ function normalize(value) {
 
 async function readLayout() {
   try {
+    await migrateLegacyLayout();
     return normalize(JSON.parse(await readFile(statePath(), 'utf8')));
   } catch {
     return EMPTY;
