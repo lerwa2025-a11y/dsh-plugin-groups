@@ -200,6 +200,11 @@ function normalize(value) {
       acc[slot] = {
         name: typeof raw.name === 'string' ? raw.name.trim().slice(0, 20) : '',
         at: typeof raw.at === 'string' ? raw.at : '',
+        // Every plugin that existed when the slot was saved. Separate from
+        // `states`, which only covers what a preset may switch: locked group
+        // members are excluded there by design, so rebuilding groups from
+        // `states` alone would drop them. Absent on slots saved by older builds.
+        present: boolMap(raw.present),
         states,
         components,
         groups,

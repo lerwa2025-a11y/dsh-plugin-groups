@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * Build stamp shown in the toolbar. Bump this whenever the Client half
      * changes so a stale page can be recognised immediately.
      */
-    const BUILD = '2026-10-20.03';
+    const BUILD = '2026-10-20.04';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must
@@ -227,6 +227,9 @@ window.__ModuleLoader__.load({
         presets[slot] = {
           name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 20) : '',
           at: typeof raw.at === 'string' ? raw.at : '',
+          // Presence of every plugin at save time; see snapshotOf for why this
+          // differs from `states`. Missing on slots written by older builds.
+          present: boolMap(raw.present),
           states,
           components,
           groups,
@@ -845,7 +848,22 @@ window.__ModuleLoader__.load({
             components[row.entryId] = Boolean(live.enabled);
           }
         }
+        /*
+         * `present` records every plugin that exists on this page, which is a
+         * different set from `states`.
+         *
+         * `states` only covers what a preset is allowed to switch: unlocking a
+         * group or the plugin itself is a safety boundary, so locked members and
+         * unswitchable plugins never appear there. Rebuilding the grouping from
+         * `states` alone then treats those very members as "did not exist when
+         * the snapshot was taken" and drops them out of their groups — which is
+         * how applying a preset used to scatter most of a locked layout into
+         * 未分组. Presence and switchability are separate questions; this field
+         * answers presence.
+         */
+        const present = Object.fromEntries(listed.filter((bundle) => bundle?.name).map((bundle) => [bundle.name, true]));
         return {
+          present,
           states,
           components,
           // The group structure is copied by value, not referenced, so editing the
@@ -861,7 +879,7 @@ window.__ModuleLoader__.load({
           notes: { ...(layout.notes ?? {}) },
           tags: JSON.parse(JSON.stringify(layout.tags ?? {})),
         };
-      }, [componentPartsOf, layout.groups, layout.notes, layout.order, layout.tags, pluginRows, presetScope]);
+      }, [componentPartsOf, layout.groups, layout.notes, layout.order, layout.tags, pluginRows, presetScope, listed]);
 
       /** Save the current state (switches, groups, components, notes, tags). */
       const savePreset = useCallback((slot) => {
@@ -1036,8 +1054,16 @@ window.__ModuleLoader__.load({
            * did not exist when the snapshot was taken. Those plugins keep no
            * membership, which is exactly how they end up in 未分组 — the page
            * derives that section from "listed but not in any group".
+           *
+           * Presence comes from `present` when the slot has one. Older slots
+           * predate that field, so they fall back to `states` and keep their old
+           * (narrower) behaviour rather than failing to load.
            */
-          const known = new Set(Object.keys(preset.states));
+          const known = new Set(
+            preset.present && typeof preset.present === 'object'
+              ? Object.keys(preset.present)
+              : Object.keys(preset.states ?? {}),
+          );
           const groups = preset.groups.map((group) => {
             const members = (group.members ?? []).filter((name) => {
               if (known.has(name)) return true;
