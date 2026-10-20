@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * Build stamp shown in the toolbar. Bump this whenever the Client half
      * changes so a stale page can be recognised immediately.
      */
-    const BUILD = '2026-10-19.16';
+    const BUILD = '2026-10-20.02';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must
@@ -65,7 +65,14 @@ window.__ModuleLoader__.load({
       return (TAG_COLORS.find((entry) => entry.key === key) ?? TAG_COLORS[TAG_COLORS.length - 1]).color;
     }
 
-    const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {} };
+    const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {}, presets: {} };
+
+    /**
+     * Fixed preset slots. Exactly two, as asked: one for "work mode", one for
+     * "quiet mode" — the names are the user's to change, the ids are not, so a
+     * saved preset never becomes orphaned by a rename.
+     */
+    const PRESET_SLOTS = ['p1', 'p2'];
 
     // ------------------------------------------------------------ remote/data
 
@@ -145,6 +152,89 @@ window.__ModuleLoader__.load({
           }));
         if (clean.length) tags[name] = clean;
       }
+      /*
+       * Presets: two fixed slots, each a full snapshot of "how the plugin page
+       * looked and which parts were running".
+       *
+       * A preset carries four things, because a "situation" is not just a set of
+       * switches:
+       *   states   package -> on/off, the plugin-level switches
+       *   groups   the grouping itself: names, colours, members, locks
+       *   components entryId -> on/off, the pieces inside each bundle
+       *   notes/tags  the user's own annotations
+       *
+       * Everything is optional and versioned by absence: a preset saved before a
+       * field existed simply does not restore that field, so old presets keep
+       * working instead of silently clearing things.
+       *
+       * `states` and `components` map a name -> boolean. A name absent from the
+       * snapshot is not touched on apply, which is what keeps plugins installed
+       * after the snapshot sitting in "未分组" with their current switches.
+       */
+      const rawPresets = source.presets && typeof source.presets === 'object' && !Array.isArray(source.presets)
+        ? source.presets
+        : {};
+      const presets = {};
+      for (const slot of PRESET_SLOTS) {
+        const raw = rawPresets[slot];
+        if (!raw || typeof raw !== 'object') continue;
+        const boolMap = (value) => {
+          const out = {};
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+          for (const [key, on] of Object.entries(value)) {
+            if (typeof key === 'string' && typeof on === 'boolean') out[key] = on;
+          }
+          return out;
+        };
+        const states = boolMap(raw.states);
+        const components = boolMap(raw.components);
+        const groups = Array.isArray(raw.groups)
+          ? raw.groups
+            .filter((group) => group && typeof group === 'object' && typeof group.id === 'string')
+            .map((group) => ({
+              id: group.id,
+              name: typeof group.name === 'string' ? group.name : '未命名分组',
+              accent: typeof group.accent === 'string' ? group.accent : '',
+              members: Array.isArray(group.members)
+                ? group.members.filter((member) => typeof member === 'string')
+                : [],
+              locked: Boolean(group.locked),
+            }))
+          : null;
+        const order = Array.isArray(raw.order)
+          ? raw.order.filter((id) => typeof id === 'string')
+          : null;
+        const notes = {};
+        if (raw.notes && typeof raw.notes === 'object' && !Array.isArray(raw.notes)) {
+          for (const [name, text] of Object.entries(raw.notes)) {
+            if (typeof text === 'string' && text.trim()) notes[name] = text;
+          }
+        }
+        const tags = {};
+        if (raw.tags && typeof raw.tags === 'object' && !Array.isArray(raw.tags)) {
+          for (const [name, list] of Object.entries(raw.tags)) {
+            if (!Array.isArray(list)) continue;
+            const clean = list
+              .filter((tag) => tag && typeof tag === 'object' && typeof tag.text === 'string' && tag.text.trim())
+              .map((tag) => ({
+                text: tag.text.trim().slice(0, 40),
+                color: TAG_COLOR_KEYS.includes(tag.color) ? tag.color : 'gray',
+              }));
+            if (clean.length) tags[name] = clean;
+          }
+        }
+        if (Object.keys(states).length === 0 && !groups && Object.keys(notes).length === 0) continue;
+        presets[slot] = {
+          name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 20) : '',
+          at: typeof raw.at === 'string' ? raw.at : '',
+          states,
+          components,
+          groups,
+          order,
+          notes,
+          tags,
+        };
+      }
       return {
         version: 1,
         groups: Array.isArray(source.groups)
@@ -158,6 +248,7 @@ window.__ModuleLoader__.load({
         order: ids(source.order),
         notes,
         tags,
+        presets,
       };
     }
 
@@ -183,6 +274,9 @@ window.__ModuleLoader__.load({
           ...stored,
           notes: { ...(local?.notes ?? {}), ...stored.notes },
           tags: { ...(local?.tags ?? {}), ...stored.tags },
+          // Presets get the same treatment as notes and tags: the file wins per
+          // slot, the browser copy fills any slot the Host dropped.
+          presets: { ...(local?.presets ?? {}), ...stored.presets },
         };
         // Persist the merge back so the browser copy tracks the file.
         writeLocal(merged);
@@ -254,9 +348,30 @@ window.__ModuleLoader__.load({
 
       const [phase, setPhase] = useState('loading');
       const [bundles, setBundles] = useState([]);
+      /**
+       * Component rows from `listPlugins()`, keyed by `entryId`.
+       *
+       * This is what makes "the plugin is on but one of its parts is not" visible.
+       * A bundle is one package; the pieces it inserts are separate entries that
+       * each carry their own `enabled`. The official detail page shows them as
+       * "共 N 个 · M 运行中" — this map holds the same facts so the group view can
+       * reconcile them per row instead of trusting the bundle switch alone.
+       */
+      const [pluginRows, setPluginRows] = useState({});
       const [notice, setNotice] = useState(null);
       const [layout, setLayout] = useState(EMPTY);
       const [busy, setBusy] = useState({});
+
+      /**
+       * Preset application progress: { slot, done, total } while a preset is
+       * being restored, null otherwise. Applying touches up to ~30 plugins one
+       * at a time, so the toolbar has to say what it is doing instead of just
+       * freezing.
+       */
+      const [applying, setApplying] = useState(null);
+
+      /** Which preset menu is open: null | 'save' | 'apply'. */
+      const [presetMenu, setPresetMenu] = useState(null);
       const [picker, setPicker] = useState(null);
       const [drag, setDrag] = useState(null);
       const [editing, setEditing] = useState(null);
@@ -270,6 +385,20 @@ window.__ModuleLoader__.load({
 
       /** The tag being typed for one package: { name, text, color }. */
       const [tagDraft, setTagDraft] = useState(null);
+
+      // A preset menu stays open until something is chosen. Clicking anywhere
+      // outside closes it, which is what every menu on the web does and saves the
+      // user a second click on the button that opened it.
+      useEffect(() => {
+        if (!presetMenu) return undefined;
+        const close = (event) => {
+          const target = event.target;
+          if (target instanceof Element && target.closest('.pgv-menu-wrap')) return;
+          setPresetMenu(null);
+        };
+        document.addEventListener('mousedown', close);
+        return () => document.removeEventListener('mousedown', close);
+      }, [presetMenu]);
 
       // Open/closed state lives only in this component: nothing is persisted,
       // so reopening the tab always starts fully collapsed.
@@ -314,7 +443,14 @@ window.__ModuleLoader__.load({
             setNotice({ kind: 'error', text: '官方插件清单读取失败。' });
             return;
           }
-          setBundles(Array.isArray(bundleRes.value) ? bundleRes.value : []);
+          const bundleList = Array.isArray(bundleRes.value) ? bundleRes.value : [];
+          const rows = Array.isArray(pluginRes.value) ? pluginRes.value : [];
+          const byEntryId = {};
+          for (const row of rows) {
+            if (row?.entryId) byEntryId[row.entryId] = row;
+          }
+          setBundles(bundleList);
+          setPluginRows(byEntryId);
           setPhase('ready');
         } catch (error) {
           setPhase('error');
@@ -450,8 +586,41 @@ window.__ModuleLoader__.load({
             kind: 'muted',
           });
         }
+
+        /*
+         * Component health, always shown when measurable.
+         *
+         * A single-part plugin (1/1) is dimmed rather than dropped: "组件 1/1"
+         * repeated on every row is noise, so it stays visible but quiet, keeping
+         * the column aligned while attention goes to the ones that differ.
+         *
+         * Three colours, same rule as the group header: green when every part is
+         * running, amber when some are missing, red when none are. Red on a
+         * switched-off plugin is expected rather than alarming, so it is styled
+         * as "off" instead — the plugin is merely not running.
+         */
+        const parts = componentPartsOf(bundle);
+        if (parts) {
+          const health = healthOf(parts.on, parts.total);
+          const sleeping = parts.sleeping
+            .map((row) => row.rowId || row.moduleName || row.entryId)
+            .join('、');
+          const texts = sleeping
+            ? `插件开着，${parts.total} 个组件里跑了 ${parts.on} 个，没跑的是：${sleeping}`
+            : `插件的 ${parts.total} 个组件全部运行中`;
+          const kinds = { all: 'ok-count', partial: 'partial-count', none: 'broken', empty: 'muted' };
+          badges.push({
+            key: 'components',
+            label: `组件 ${parts.on}/${parts.total}`,
+            text: texts,
+            kind: bundle.enabled === false && parts.on === 0
+              ? 'off-count'
+              : kinds[health],
+            quiet: parts.total === 1 && parts.on === 1,
+          });
+        }
         return badges;
-      }, [lockReasonOf]);
+      }, [lockReasonOf, componentPartsOf]);
 
       /**
        * The bundles this view lists.
@@ -500,8 +669,97 @@ window.__ModuleLoader__.load({
         [assignable, groupedNames],
       );
 
+      /**
+       * Reconcile a bundle against the live component rows.
+       *
+       * A bundle that reports `enabled: true` can still have pieces that never
+       * started: they sit in the patch layer but are switched off, or they failed
+       * to mount. `listBundles()` alone cannot show that, so this reads the
+       * bundle's `rows`, looks each one up in `listPlugins()` by `entryId`, and
+       * counts how many are actually on.
+       *
+       * Rows without an `entryId` are skipped rather than guessed: those belong to
+       * a composition this profile does not address, so there is no live state to
+       * compare and a wrong count would be worse than no count.
+       *
+       * Returns null when there is nothing to reconcile (no rows, or none
+       * addressable), so the view can stay quiet instead of showing "0/0".
+       */
+      function componentPartsOf(bundle) {
+        const all = Array.isArray(bundle?.rows) ? bundle.rows : [];
+        // Rows without an entryId have no live Loader entry here, and rows owned
+        // by the Host cannot be switched, so neither can be judged. Counting them
+        // would brand a healthy plugin as broken; they are left out entirely.
+        const addressable = all.filter((row) => (
+          row
+          && typeof row.entryId === 'string'
+          && row.readOnlyReason !== 'management-required'
+          && row.readOnlyReason !== 'unaddressable'
+        ));
+        if (addressable.length === 0) return null;
+        const sleeping = addressable.filter((row) => !pluginRows[row.entryId]?.enabled);
+        return {
+          total: addressable.length,
+          on: addressable.length - sleeping.length,
+          sleeping,
+        };
+      }
+
       /** Which groups are currently open, from in-memory state only. */
       const isOpen = useCallback((id) => Boolean(openGroups[id]), [openGroups]);
+
+      /**
+       * Third-party count, for the toolbar.
+       *
+       * "Third party" here means: not shipped by DeepSeek. The `official` flag is
+       * the only reliable marker — it is false for DSH's own run shapes too, so
+       * those are filtered by name before counting, exactly as `listed` does.
+       * Local packages (`@local/…`) are third party, which is what the user asked
+       * for: things they installed or wrote themselves.
+       */
+      const thirdPartyCount = useMemo(
+        () => listed.filter((bundle) => bundle.official !== true).length,
+        [listed],
+      );
+
+      /**
+       * A three-way health verdict for one ratio: 'all' | 'partial' | 'none'.
+       * Shared by the group header and the component badge so the same numbers
+       * always mean the same colour.
+       */
+      function healthOf(on, total) {
+        if (total === 0) return 'empty';
+        if (on === total) return 'all';
+        if (on === 0) return 'none';
+        return 'partial';
+      }
+
+      /**
+       * Roll the group's members up into one component-level tally.
+       *
+       * The header already counts whole plugins; this counts what those plugins
+       * are made of, because a group can read "5/5 enabled" while several of its
+       * members are running half their parts. Each member contributes only when
+       * `componentPartsOf` can measure it, so groups of mixed kinds still total
+       * something honest instead of counting nothing as a failure.
+       */
+      function componentTallyOf(memberNames) {
+        let on = 0;
+        let total = 0;
+        const offenders = [];
+        for (const name of memberNames) {
+          const bundle = bundleByName.get(name);
+          if (!bundle) continue;
+          const parts = componentPartsOf(bundle);
+          if (!parts) continue;
+          on += parts.on;
+          total += parts.total;
+          if (parts.sleeping.length > 0 && bundle.enabled !== false) {
+            offenders.push(`${labelOf(bundle, name)}（缺 ${parts.sleeping.length}）`);
+          }
+        }
+        return { on, total, offenders };
+      }
 
       // -------------------------------------------------------------- mutations
 
@@ -538,6 +796,339 @@ window.__ModuleLoader__.load({
           setBusy((prev) => { const next = { ...prev }; delete next[name]; return next; });
         }
       }, []);
+
+      // ------------------------------------------------------------- presets
+
+      /**
+       * The bundles a preset is allowed to record and restore.
+       *
+       * Excluded, and the reason each one matters:
+       *   - this plugin itself: restoring it to "off" would kill the page that
+       *     is doing the restoring, and the tab would be left pointing at a
+       *     stopped plugin.
+       *   - `lockReasonOf(bundle)` set: missing packages, kernel rows the Host
+       *     owns, and unaddressable rows cannot be switched at all, so a preset
+       *     that "restored" them would lie about what happened.
+       *   - members of a locked group: the lock means "leave this alone", so a
+       *     preset must not be a back door around it.
+       */
+      const presetScope = useCallback(() => {
+        const lockedMembers = new Set();
+        for (const group of groups) {
+          if (!group.locked) continue;
+          for (const member of group.members ?? []) lockedMembers.add(member);
+        }
+        return listed.filter((bundle) => (
+          bundle?.name
+          && bundle.enabled !== undefined
+          && !lockReasonOf(bundle)
+          && !lockedMembers.has(bundle.name)
+        ));
+      }, [groups, listed, lockReasonOf]);
+
+      /**
+       * Everything a preset records, in one place so save and apply cannot drift
+       * apart. Components are keyed by `entryId` rather than `rowId`: rowIds are
+       * local to a bundle, entryIds are what `setPluginEnabled` actually takes.
+       */
+      const snapshotOf = useCallback(() => {
+        const states = {};
+        const components = {};
+        for (const bundle of presetScope()) {
+          states[bundle.name] = Boolean(bundle.enabled);
+          const parts = componentPartsOf(bundle);
+          if (!parts) continue;
+          for (const row of (bundle.rows ?? [])) {
+            if (!row || typeof row.entryId !== 'string') continue;
+            const live = pluginRows[row.entryId];
+            if (!live) continue;
+            components[row.entryId] = Boolean(live.enabled);
+          }
+        }
+        return {
+          states,
+          components,
+          // The group structure is copied by value, not referenced, so editing the
+          // groups afterwards cannot retroactively rewrite a saved preset.
+          groups: (layout.groups ?? []).map((group) => ({
+            id: group.id,
+            name: group.name,
+            accent: group.accent ?? '',
+            members: [...(group.members ?? [])],
+            locked: Boolean(group.locked),
+          })),
+          order: [...(layout.order ?? [])],
+          notes: { ...(layout.notes ?? {}) },
+          tags: JSON.parse(JSON.stringify(layout.tags ?? {})),
+        };
+      }, [componentPartsOf, layout.groups, layout.notes, layout.order, layout.tags, pluginRows, presetScope]);
+
+      /** Save the current state (switches, groups, components, notes, tags). */
+      const savePreset = useCallback((slot) => {
+        const snap = snapshotOf();
+        const count = Object.keys(snap.states).length;
+        if (count === 0 && snap.groups.length === 0) {
+          setNotice({ kind: 'warn', text: '现在没有可保存的内容，预设没保存。' });
+          return false;
+        }
+        applyLayout((prev) => ({
+          ...prev,
+          presets: {
+            ...(prev.presets ?? {}),
+            [slot]: {
+              name: (prev.presets ?? {})[slot]?.name ?? '',
+              at: new Date().toISOString(),
+              ...snap,
+            },
+          },
+        }));
+        const onCount = Object.values(snap.states).filter(Boolean).length;
+        // The write above keeps an existing name (`?? ''`), so the label read
+        // from the current layout is also the label after the save.
+        const kept = (layout.presets ?? {})[slot];
+        setNotice({
+          kind: 'ok',
+          text: `已保存到${presetLabel(kept, slot)}：`
+            + `${onCount}/${count} 个插件开着 · ${snap.groups.length} 个分组 · `
+            + `${Object.keys(snap.components).length} 个组件 · ${Object.keys(snap.notes).length} 条备注 · `
+            + `${Object.keys(snap.tags).length} 组标签。`,
+        });
+        return true;
+      }, [applyLayout, layout.presets, snapshotOf]);
+
+      /**
+       * Apply one slot. Four passes, in this order, because the later ones depend
+       * on the earlier ones being settled:
+       *
+       *   1. plugin switches — the bulk of the work, one Remote call each
+       *   2. component switches — only for bundles the preset left ON, since a
+       *      disabled bundle has no running parts to restore
+       *   3. group structure — replaces groups/order wholesale, but only for
+       *      plugins that were present when the snapshot was taken, so anything
+       *      installed since stays in 未分组 instead of being swallowed
+       *   4. notes and tags — pure data, no Remote calls, applied last
+       *
+       * Remote calls are sequential on purpose: the official API writes through a
+       * patch file per call, and firing thirty writes at once is how a
+       * half-applied preset happens. Everything the user needs to hear is
+       * collected and reported once at the end rather than flooding the notice bar.
+       */
+      const applyPreset = useCallback(async (slot) => {
+        const preset = (layout.presets ?? {})[slot];
+        if (!preset) return;
+        const remote = pluginManagerRemote();
+        if (!remote) {
+          setNotice({ kind: 'error', text: '读不到官方插件管理接口，没法应用预设。' });
+          return;
+        }
+
+        // --- pass 1: plugin switches -------------------------------------
+        const scope = presetScope();
+        const switchPlan = [];
+        for (const bundle of scope) {
+          if (!(bundle.name in preset.states)) continue;
+          if (Boolean(bundle.enabled) === preset.states[bundle.name]) continue;
+          switchPlan.push(bundle.name);
+        }
+
+        // --- pass 2: component switches ----------------------------------
+        // Only rows we can address, only bundles the preset turns on, and only
+        // where the live row disagrees with the snapshot.
+        const componentPlan = [];
+        for (const bundle of scope) {
+          if (!(bundle.name in preset.states)) continue;
+          // A bundle that will end up off is skipped: its parts are off by
+          // definition, and waking one up under a disabled parent does nothing.
+          if (preset.states[bundle.name] !== true) continue;
+          for (const row of (bundle.rows ?? [])) {
+            if (!row || typeof row.entryId !== 'string') continue;
+            if (row.readOnlyReason === 'management-required' || row.readOnlyReason === 'unaddressable') continue;
+            if (!(row.entryId in preset.components)) continue;
+            const live = pluginRows[row.entryId];
+            if (!live) continue;
+            if (Boolean(live.enabled) === preset.components[row.entryId]) continue;
+            componentPlan.push({ entryId: row.entryId, bundle: bundle.name, on: preset.components[row.entryId] });
+          }
+        }
+
+        const total = switchPlan.length + componentPlan.length;
+        const hasLayoutWork = Boolean(preset.groups)
+          || Object.keys(preset.notes ?? {}).length > 0
+          || Object.keys(preset.tags ?? {}).length > 0;
+        if (total === 0 && !hasLayoutWork) {
+          setNotice({ kind: 'ok', text: '当前状态和这个预设一致，不需要改动。' });
+          return;
+        }
+
+        // --- confirm before doing anything destructive -------------------
+        // Applying a preset with a group snapshot replaces the whole grouping.
+        // Say so up front, with numbers, instead of discovering it afterwards.
+        if (preset.groups) {
+          const lines = [
+            `应用${presetLabel(preset, slot)}会做这些事：`,
+            `· 改 ${total} 处开关（${switchPlan.length} 个插件、${componentPlan.length} 个组件）`,
+            `· 用预设里的 ${preset.groups.length} 个分组覆盖现在的 ${(layout.groups ?? []).length} 个分组`,
+            '',
+            '现在新建的分组会被替换掉。预设之后新装的插件不会被放进任何组，会留在「未分组」。',
+          ];
+          if (!window.confirm(lines.join('\n'))) return;
+        }
+
+        setApplying({ slot, done: 0, total });
+        setNotice(null);
+        let changed = 0;
+        let failed = 0;
+        let restart = false;
+
+        const step = () => setApplying((prev) => (prev ? { ...prev, done: prev.done + 1 } : prev));
+
+        try {
+          for (const name of switchPlan) {
+            setBusy((prev) => ({ ...prev, [name]: true }));
+            try {
+              const result = await remote.setBundleEnabled(name, preset.states[name]);
+              const application = result?.ok ? result.value?.application : null;
+              if (application === 'applied' || application === 'restart-required') {
+                changed += 1;
+                if (application === 'restart-required') restart = true;
+                setBundles((prev) => prev.map((bundle) => (
+                  bundle.name === name ? { ...bundle, enabled: preset.states[name] } : bundle
+                )));
+              } else {
+                failed += 1;
+              }
+            } catch {
+              failed += 1;
+            } finally {
+              setBusy((prev) => { const next = { ...prev }; delete next[name]; return next; });
+              step();
+            }
+          }
+
+          for (const item of componentPlan) {
+            try {
+              const result = await remote.setPluginEnabled(item.entryId, item.on);
+              const application = result?.ok ? result.value?.application : null;
+              if (application === 'applied' || application === 'restart-required') {
+                changed += 1;
+                if (application === 'restart-required') restart = true;
+                setPluginRows((prev) => (
+                  prev[item.entryId] ? { ...prev, [item.entryId]: { ...prev[item.entryId], enabled: item.on } } : prev
+                ));
+              } else {
+                failed += 1;
+              }
+            } catch {
+              failed += 1;
+            } finally {
+              step();
+            }
+          }
+        } finally {
+          setApplying(null);
+        }
+
+        // --- pass 3 + 4: group structure, notes, tags --------------------
+        let keptOut = 0;
+        if (preset.groups) {
+          /*
+           * Rebuild the grouping from the snapshot, but drop every member that
+           * did not exist when the snapshot was taken. Those plugins keep no
+           * membership, which is exactly how they end up in 未分组 — the page
+           * derives that section from "listed but not in any group".
+           */
+          const known = new Set(Object.keys(preset.states));
+          const groups = preset.groups.map((group) => {
+            const members = (group.members ?? []).filter((name) => {
+              if (known.has(name)) return true;
+              keptOut += 1;
+              return false;
+            });
+            return {
+              id: group.id,
+              name: group.name,
+              accent: group.accent ?? '',
+              members,
+              locked: Boolean(group.locked),
+            };
+          });
+          const groupIds = new Set(groups.map((group) => group.id));
+          const order = (preset.order ?? []).filter((id) => groupIds.has(id));
+          for (const group of groups) {
+            if (!order.includes(group.id)) order.push(group.id);
+          }
+          applyLayout((prev) => ({
+            ...prev,
+            groups,
+            order,
+            notes: { ...(preset.notes ?? {}) },
+            tags: JSON.parse(JSON.stringify(preset.tags ?? {})),
+          }));
+        } else {
+          // No group snapshot in this slot (saved by an older build): restore
+          // only the annotations, and leave the grouping untouched.
+          applyLayout((prev) => ({
+            ...prev,
+            notes: { ...(preset.notes ?? {}) },
+            tags: JSON.parse(JSON.stringify(preset.tags ?? {})),
+          }));
+        }
+        setOpenGroups({});
+
+        const parts = [`已应用${presetLabel(preset, slot)}：改了 ${changed} 处开关`];
+        if (preset.groups) parts.push(`分组已换成预设里的 ${preset.groups.length} 个`);
+        if (keptOut > 0) parts.push(`${keptOut} 个后来新装的插件留在「未分组」`);
+        if (failed > 0) parts.push(`${failed} 处没改成（可能被更高优先级覆盖，或用不了）`);
+        if (restart) parts.push('部分改动要重启 DSH 才完全生效');
+        setNotice({ kind: failed > 0 ? 'warn' : 'ok', text: parts.join('，') + '。' });
+      }, [applyLayout, layout.groups, layout.presets, pluginRows, presetScope]);
+
+      /**
+       * What applying a slot would change, without changing anything. Used by the
+       * menu so the label can say how much work a click is worth.
+       */
+      const presetImpact = useCallback((preset) => {
+        if (!preset) return null;
+        const scope = presetScope();
+        let switches = 0;
+        let components = 0;
+        for (const bundle of scope) {
+          if (bundle.name in preset.states && Boolean(bundle.enabled) !== preset.states[bundle.name]) switches += 1;
+          if (!(bundle.name in preset.states) || preset.states[bundle.name] !== true) continue;
+          for (const row of (bundle.rows ?? [])) {
+            if (!row || typeof row.entryId !== 'string') continue;
+            if (!(row.entryId in preset.components)) continue;
+            const live = pluginRows[row.entryId];
+            if (live && Boolean(live.enabled) !== preset.components[row.entryId]) components += 1;
+          }
+        }
+        return {
+          switches,
+          components,
+          groups: preset.groups ? preset.groups.length : null,
+          total: switches + components,
+        };
+      }, [pluginRows, presetScope]);
+
+      /** Name a slot for display: its custom name, else the slot number. */
+      function presetLabel(preset, slot) {
+        return preset?.name ? `预设「${preset.name}」` : `预设 ${slot === 'p1' ? '1' : '2'}`;
+      }
+
+      /** Rename one slot (empty clears back to the default label). */
+      const renamePreset = useCallback((slot, name) => {
+        applyLayout((prev) => {
+          const current = (prev.presets ?? {})[slot];
+          if (!current) return prev;
+          return {
+            ...prev,
+            presets: {
+              ...(prev.presets ?? {}),
+              [slot]: { ...current, name: String(name ?? '').trim().slice(0, 20) },
+            },
+          };
+        });
+      }, [applyLayout]);
 
       const addGroup = useCallback(() => {
         const id = `g${Date.now().toString(36)}`;
@@ -588,17 +1179,22 @@ window.__ModuleLoader__.load({
         });
       }, []);
 
-      /** Open every group at once. */
-      const expandAll = useCallback(() => {
+      /**
+       * Expand or collapse every group from the single toolbar button.
+       *
+       * `collapse` true clears the map; false fills it. Either way the result is
+       * one object, so a partially mixed page snaps to one extreme rather than
+       * flipping each group individually.
+       */
+      const toggleAll = useCallback((collapse) => {
+        if (collapse) {
+          setOpenGroups({});
+          return;
+        }
         const all = {};
         for (const group of groups) all[group.id] = true;
         setOpenGroups(all);
       }, [groups]);
-
-      /** Close every group at once. */
-      const collapseAll = useCallback(() => {
-        setOpenGroups({});
-      }, []);
 
       /**
        * Lock or unlock one group. A locked group keeps its position and its
@@ -871,7 +1467,7 @@ window.__ModuleLoader__.load({
                 missing ? `${bundleName}（未安装）` : labelOf(bundle, bundleName)),
               ...badgesOf(bundle).map((badge) => h('span', {
                 key: badge.key,
-                className: `pgv-badge is-${badge.kind}`,
+                className: `pgv-badge is-${badge.kind}` + (badge.quiet ? ' is-quiet' : ''),
                 title: badge.text,
               }, badge.label)),
               // User tags sit right after the name. Clicking one removes it, but a
@@ -1103,8 +1699,55 @@ window.__ModuleLoader__.load({
                 onClick: () => { if (!locked) setEditing({ id: group.id, value: group.name }); },
               }, group.name),
             locked ? h('span', { key: 'lockbadge', className: 'pgv-lockbadge', title: '已锁定' }, '已锁定') : null,
-            h('span', { key: 'count', className: 'pgv-count', title: '已启用数 / 组内插件数' },
-              `${onCount}/${members.length}`),
+            /*
+             * The ratio keeps its numbers — they say how big the group is — but the
+             * colour carries the health, so all-on (green), mixed (amber) and
+             * all-off (red) separate at a glance without reading the digits.
+             * The title spells the same thing out for anyone who cannot use the hue.
+             */
+            (() => {
+              const health = healthOf(onCount, members.length);
+              const texts = {
+                all: `组内 ${members.length} 个插件全部启用`,
+                partial: `组内 ${members.length} 个插件，其中 ${onCount} 个启用、${members.length - onCount} 个禁用`,
+                none: `组内 ${members.length} 个插件全部禁用`,
+                empty: '这个组还是空的',
+              };
+              return h('span', {
+                key: 'count',
+                className: `pgv-count is-${health}`,
+                title: texts[health],
+              }, `${onCount}/${members.length}`);
+            })(),
+            /*
+             * A second dot for the deeper layer: the numbers above count whole
+             * plugins, this counts the components inside them. It is a dot rather
+             * than another ratio because it answers a yes/no question — "is this
+             * group's machinery complete?" — and the tooltip names the culprits.
+             *
+             * Hidden when there is nothing measurable in the group, and dimmed
+             * rather than green when the group itself is switched off, because
+             * zero running components is the expected result there.
+             */
+            (() => {
+              const tally = componentTallyOf(members);
+              if (tally.total === 0) return null;
+              const health = healthOf(tally.on, tally.total);
+              const groupOff = members.length > 0 && onCount === 0;
+              const kind = groupOff ? 'idle' : health;
+              const text = groupOff
+                ? `组内插件都已禁用，${tally.total} 个组件都没运行`
+                : tally.offenders.length === 0
+                  ? `组内 ${tally.total} 个组件全部运行中`
+                  : `组内 ${tally.total} 个组件，跑了 ${tally.on} 个。有零件没跑的插件：${tally.offenders.join('、')}`;
+              return h('span', {
+                key: 'parts',
+                className: `pgv-partdot is-${kind}`,
+                role: 'img',
+                'aria-label': text,
+                title: text,
+              });
+            })(),
             h('span', { key: 'grow', className: 'pgv-grow' }),
             iconButton('add', '＋', '添加插件', {
               title: locked ? '已锁定的分组不能添加插件' : '从这个组里挑选要加入的插件',
@@ -1182,18 +1825,133 @@ window.__ModuleLoader__.load({
           onClick: () => { readInventory(); },
         }, '↻ 刷新'),
         h('span', { key: 'sep', className: 'pgv-sep' }),
-        h('button', {
-          key: 'expandAll', type: 'button', className: 'pgv-btn',
-          title: '把所有分组都展开',
-          disabled: groups.length === 0 || groups.every((group) => isOpen(group.id)),
-          onClick: expandAll,
-        }, '▾ 全部展开'),
-        h('button', {
-          key: 'collapseAll', type: 'button', className: 'pgv-btn',
-          title: '把所有分组都收起，只看组名',
-          disabled: groups.length === 0 || groups.every((group) => !isOpen(group.id)),
-          onClick: collapseAll,
-        }, '▸ 全部收起'),
+        /*
+         * One button instead of two. Both directions in one control keeps the
+         * toolbar compact and makes the current state readable from the label:
+         * it says what the next click does, not which extreme it is at.
+         *
+         * The old pair also had a dead state: both buttons went disabled at the
+         * same moment (no groups, or every group already at the button's end),
+         * so the toolbar showed two greyed-out controls that could not act.
+         */
+        (() => {
+          const hasGroups = groups.length > 0;
+          const openCount = groups.filter((group) => isOpen(group.id)).length;
+          const allOpen = hasGroups && openCount === groups.length;
+          const noneOpen = openCount === 0;
+          return h('button', {
+            key: 'toggleAll', type: 'button', className: 'pgv-btn',
+            title: allOpen
+              ? '把所有分组都收起，只看组名'
+              : '把所有分组都展开，显示组内插件',
+            disabled: !hasGroups || (allOpen && noneOpen),
+            onClick: () => toggleAll(allOpen),
+          }, [
+            h('span', { key: 'g', className: 'pgv-btn-glyph' }, allOpen ? '▸' : '▾'),
+            h('span', { key: 'l' }, allOpen ? '全部收起' : '全部展开'),
+          ]);
+        })(),
+        h('span', { key: 'sep2', className: 'pgv-sep' }),
+        /*
+         * The two preset controls. Deliberately a pair of menus rather than two
+         * fixed slots side by side: the toolbar already carries six controls, and
+         * four more columns would push the page stats off the row. Each menu is
+         * two items long, so the extra click costs less than the width does.
+         */
+        h('div', { key: 'presetSave', className: 'pgv-menu-wrap' }, [
+          h('button', {
+            key: 'btn', type: 'button',
+            className: 'pgv-btn' + (presetMenu === 'save' ? ' is-open' : ''),
+            title: '把现在所有插件的开/关状态存成一个快照，之后可以一键恢复',
+            disabled: Boolean(applying),
+            onClick: () => setPresetMenu(presetMenu === 'save' ? null : 'save'),
+          }, [
+            h('span', { key: 'g', className: 'pgv-btn-glyph' }, '💾'),
+            h('span', { key: 'l' }, '存为预设'),
+          ]),
+          presetMenu === 'save'
+            ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
+              const preset = (layout.presets ?? {})[slot];
+              return h('button', {
+                key: slot, type: 'button', className: 'pgv-menu-item',
+                title: preset
+                  ? `覆盖保存：现在是 ${Object.values(preset.states).filter(Boolean).length} 开 / ${Object.values(preset.states).filter((v) => !v).length} 关，${(preset.groups ?? []).length} 个分组`
+                  : '这个槽位还空着',
+                onClick: () => { savePreset(slot); setPresetMenu(null); },
+              }, [
+                h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
+                h('span', { key: 's', className: 'pgv-menu-sub' }, preset
+                  ? `${Object.values(preset.states).filter(Boolean).length} 开 · ${(preset.groups ?? []).length} 组`
+                  : '空'),
+              ]);
+            }))
+            : null,
+        ]),
+        h('div', { key: 'presetApply', className: 'pgv-menu-wrap' }, [
+          h('button', {
+            key: 'btn', type: 'button',
+            className: 'pgv-btn' + (presetMenu === 'apply' ? ' is-open' : ''),
+            title: '把插件开关一键改成某个预设里存的样子',
+            disabled: Boolean(applying),
+            onClick: () => setPresetMenu(presetMenu === 'apply' ? null : 'apply'),
+          }, [
+            h('span', { key: 'g', className: 'pgv-btn-glyph' }, '⚡'),
+            h('span', { key: 'l' }, applying ? `应用中 ${applying.done}/${applying.total}` : '应用预设'),
+          ]),
+          presetMenu === 'apply'
+            ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
+              const preset = (layout.presets ?? {})[slot];
+              const impact = presetImpact(preset);
+              return h('div', { key: slot, className: 'pgv-menu-row' }, [
+                h('button', {
+                  key: 'go', type: 'button',
+                  className: 'pgv-menu-item' + (preset ? '' : ' is-empty'),
+                  disabled: !preset,
+                  /*
+                   * The label says how much this click costs, not just which slot
+                   * it is. "应用 预设1" is a promise; "预设1  3插件·8组件·8组" is
+                   * measurable, and the difference matters when a slot rewrites
+                   * the whole grouping.
+                   */
+                  title: preset
+                    ? [
+                      `用这个预设：改 ${impact.switches} 个插件开关、${impact.components} 个组件`,
+                      impact.groups === null ? '（这份预设没有存分组）' : `分组会换成预设里的 ${impact.groups} 个`,
+                    ].join('\n')
+                    : '这个槽位还没存过东西',
+                  onClick: () => {
+                    setPresetMenu(null);
+                    applyPreset(slot);
+                  },
+                }, [
+                  h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
+                  h('span', { key: 's', className: 'pgv-menu-sub' }, preset
+                    ? [
+                      `${impact.switches}插件`,
+                      impact.groups === null ? null : `${impact.groups}组`,
+                      impact.components > 0 ? `${impact.components}组件` : null,
+                    ].filter(Boolean).join(' · ')
+                    : '空'),
+                ]),
+                // Renaming lives here rather than in the save menu: the save menu
+                // writes, and mixing "overwrite this slot" with "rename this slot"
+                // in one list is how you rename the wrong one by accident.
+                preset
+                  ? h('button', {
+                    key: 'rn', type: 'button', className: 'pgv-menu-rename',
+                    title: '给这个预设起个名字，比如「干活模式」',
+                    onClick: () => {
+                      const next = window.prompt('给这个预设起个名字（留空恢复默认）', preset.name ?? '');
+                      if (next === null) return;
+                      renamePreset(slot, next);
+                      setPresetMenu(null);
+                    },
+                  }, '改名')
+                  : null,
+              ]);
+            }))
+            : null,
+        ]),
         h('span', { key: 'grow', className: 'pgv-grow' }),
         /*
          * Build stamp. It makes "is the page running the new code?" answerable at
@@ -1215,13 +1973,35 @@ window.__ModuleLoader__.load({
         h('span', { key: 'sum', className: 'pgv-hint' },
           phase === 'loading'
             ? '正在读取插件状态…'
-            : `插件 ${assignable.length} · 分组 ${groups.length} · 未分组 ${ungrouped.length}`),
+            : [
+              h('span', { key: 'total' }, `插件 ${listed.length}`),
+              h('span', { key: 'd1', className: 'pgv-sum-sep' }, '·'),
+              h('span', {
+                key: 'third',
+                className: 'pgv-sum-stat',
+                title: '不是 DSH 官方自带的插件：本地插件和你自己装的都算',
+              }, `第三方 ${thirdPartyCount}`),
+              h('span', { key: 'd2', className: 'pgv-sum-sep' }, '·'),
+              h('span', { key: 'groups' }, `分组 ${groups.length}`),
+              h('span', { key: 'd3', className: 'pgv-sum-sep' }, '·'),
+              h('span', {
+                key: 'ungrouped',
+                className: 'pgv-sum-stat' + (ungrouped.length > 0 ? ' is-warn' : ''),
+                title: '还没被分进任何组的插件',
+              }, `未分组 ${ungrouped.length}`),
+            ]),
       ]);
 
       const noticeEl = notice
         ? h('div', {
           key: 'notice',
-          className: 'pgv-notice' + (notice.kind === 'error' ? ' is-error' : ' is-warn'),
+          /*
+           * Three tones, not two. A preset save or a no-op apply is a success, and
+           * painting it the same amber as "this was overridden" trains the user to
+           * ignore the bar exactly when it matters.
+           */
+          className: 'pgv-notice'
+            + (notice.kind === 'error' ? ' is-error' : notice.kind === 'ok' ? ' is-ok' : ' is-warn'),
         }, [
           h('span', { key: 'text' }, notice.text),
           iconButton('x', '✕', '知道了', {
@@ -1275,7 +2055,7 @@ window.__ModuleLoader__.load({
                     h('span', { key: 't', className: 'pgv-title' }, labelOf(bundle, bundle.name)),
                     ...badgesOf(bundle).map((badge) => h('span', {
                       key: badge.key,
-                      className: `pgv-badge is-${badge.kind}`,
+                      className: `pgv-badge is-${badge.kind}` + (badge.quiet ? ' is-quiet' : ''),
                       title: badge.text,
                     }, badge.label)),
                     h('span', { key: 'tags', className: 'pgv-tags' }, tags.map((tag) => h('span', {
@@ -1463,6 +2243,85 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--dsw-alias-border-l1);
   border-radius: 999px; padding: 1px 7px;
 }
+/*
+ * Health colouring for an a/b ratio. The digits stay because they say how big
+ * the thing being measured is; the hue says whether that number is good, and it
+ * is never the only signal — every badge repeats it in its tooltip.
+ */
+.pgv-count.is-all {
+  color: var(--dsw-alias-state-success-primary);
+  border-color: var(--dsw-alias-state-success-primary);
+}
+.pgv-count.is-partial {
+  color: var(--dsw-alias-state-warn-primary);
+  border-color: var(--dsw-alias-state-warn-primary);
+}
+.pgv-count.is-none {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+}
+.pgv-count.is-empty { opacity: .7; }
+/* Toolbar statistics: separators and the two counts that carry extra meaning. */
+.pgv-sum-sep { opacity: .45; margin: 0 2px; }
+.pgv-sum-stat.is-warn { color: var(--dsw-alias-state-warn-primary); }
+/* Preset menus: a button that expands a two-item list below itself. */
+.pgv-menu-wrap { position: relative; display: inline-flex; }
+.pgv-btn.is-open {
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-brand-primary);
+}
+.pgv-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
+  min-width: 210px;
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-overlay);
+  border: 1px solid var(--dsw-alias-border-l2);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
+}
+.pgv-menu-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font: inherit; font-size: 12.5px; text-align: left;
+  padding: 8px 10px; border-radius: 7px; cursor: pointer;
+  color: var(--dsw-alias-label-primary);
+  background: transparent; border: 0;
+}
+.pgv-menu-item:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-2); }
+.pgv-menu-item:disabled { opacity: .4; cursor: not-allowed; }
+.pgv-menu-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pgv-menu-sub {
+  flex: 0 0 auto; font-size: 11px;
+  color: var(--dsw-alias-label-secondary);
+}
+/* One preset row: the apply target plus its rename affordance. */
+.pgv-menu-row { display: flex; align-items: center; gap: 2px; }
+.pgv-menu-row .pgv-menu-item { flex: 1 1 auto; min-width: 0; }
+.pgv-menu-rename {
+  flex: 0 0 auto;
+  font: inherit; font-size: 11px; cursor: pointer;
+  padding: 6px 8px; border-radius: 6px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent; border: 1px solid var(--dsw-alias-border-l1);
+}
+.pgv-menu-rename:hover {
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-border-l2);
+}
+/*
+ * The group's component-level health dot. Same three hues as the ratio, plus a
+ * neutral one for a group that is simply switched off. Colour is never the only
+ * cue: every dot carries a tooltip naming what is missing.
+ */
+.pgv-partdot {
+  width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto;
+  border: 1px solid transparent;
+}
+.pgv-partdot.is-all { background: var(--dsw-alias-state-success-primary); }
+.pgv-partdot.is-partial { background: var(--dsw-alias-state-warn-primary); }
+.pgv-partdot.is-none { background: var(--dsw-alias-state-error-primary); }
+.pgv-partdot.is-idle { background: var(--dsw-alias-state-idle-primary); }
+.pgv-partdot.is-empty { background: transparent; border-color: var(--dsw-alias-border-l2); }
 .pgv-chev {
   display: inline-flex; align-items: center; gap: 4px;
   font: inherit; font-size: 12px; line-height: 1;
@@ -1663,6 +2522,40 @@ window.__ModuleLoader__.load({
   background: transparent;
 }
 .pgv-badge.is-muted { opacity: .7; }
+/*
+ * Component health badges: "broken" means none of the parts are running,
+ * "partial-count" means some are. Both read as warnings rather than errors
+ * because the bundle itself is enabled — this is a mismatch, not an install
+ * failure.
+ */
+.pgv-badge.is-partial-count {
+  color: var(--dsw-alias-state-warn-primary);
+  border-color: var(--dsw-alias-state-warn-primary);
+  background: transparent;
+}
+.pgv-badge.is-broken {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+  background: transparent;
+}
+/* Every part running. */
+.pgv-badge.is-ok-count {
+  color: var(--dsw-alias-state-success-primary);
+  border-color: var(--dsw-alias-state-success-primary);
+  background: transparent;
+}
+/*
+ * Zero running because the plugin itself is off: expected, not a fault, so it
+ * borrows the neutral idle colour rather than red.
+ */
+.pgv-badge.is-off-count {
+  color: var(--dsw-alias-label-secondary);
+  border-color: var(--dsw-alias-border-l1);
+  background: transparent;
+}
+/* A 1-of-1 plugin: kept for column alignment, dimmed so it stops shouting. */
+.pgv-badge.is-quiet { opacity: .45; }
+.pgv-badge.is-quiet:hover { opacity: 1; }
 /* Second line: a user note wins, otherwise the plugin's own description.
    One line only, ellipsised: the description must never push the buttons out
    of the row or make rows different heights. */
@@ -1812,6 +2705,7 @@ window.__ModuleLoader__.load({
 }
 .pgv-notice.is-error { border-color: var(--dsw-alias-state-error-primary); }
 .pgv-notice.is-warn { border-color: var(--dsw-alias-state-warn-primary); }
+.pgv-notice.is-ok { border-color: var(--dsw-alias-state-success-primary); }
 /* Incident notice shown when the view itself fails to render. */
 .pgv-crash {
   padding: 16px; border-radius: 10px; font-size: 13px; line-height: 1.7;

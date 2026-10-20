@@ -16,7 +16,10 @@ import { dirname, join } from 'node:path';
 const ROUTE_PATH = '/plugin-groups/layout';
 const FILE_NAME = 'plugin-groups.json';
 
-const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {} };
+const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {}, presets: {} };
+
+/** Fixed preset slots; the ids never change, the labels are the user's. */
+const PRESET_SLOTS = ['p1', 'p2'];
 
 /** Directory holding the layout: the booted profile, else the process cwd. */
 function profileDir() {
@@ -77,6 +80,86 @@ function normalize(value) {
           .filter(([, list]) => list.length > 0),
       )
       : {},
+    /*
+     * Presets: two fixed slots, each a full snapshot of the page as the user left
+     * it — switches, component switches, grouping, notes and tags.
+     *
+     * The Host validates shapes but never interprets them: it has no idea which
+     * packages exist or which components can be addressed, that knowledge lives
+     * in the Client. What this code owes the feature is only that a saved field
+     * survives a write-read round trip, the same protection notes and tags get.
+     * Every field is optional on purpose, so a preset written by an older build
+     * (states only) still loads instead of being discarded.
+     */
+    presets: PRESET_SLOTS.reduce((acc, slot) => {
+      const raw = (source.presets ?? {})[slot];
+      if (!raw || typeof raw !== 'object') return acc;
+
+      const boolMap = (value) => Object.fromEntries(
+        Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+          .filter(([key, on]) => typeof key === 'string' && typeof on === 'boolean'),
+      );
+      const states = boolMap(raw.states);
+      const components = boolMap(raw.components);
+
+      const groups = Array.isArray(raw.groups)
+        ? raw.groups
+          .filter((group) => group && typeof group === 'object' && typeof group.id === 'string')
+          .map((group) => ({
+            id: group.id,
+            name: typeof group.name === 'string' ? group.name : '未命名分组',
+            accent: typeof group.accent === 'string' ? group.accent : '',
+            members: Array.isArray(group.members)
+              ? group.members.filter((member) => typeof member === 'string')
+              : [],
+            locked: Boolean(group.locked),
+          }))
+        : null;
+
+      const order = Array.isArray(raw.order)
+        ? raw.order.filter((id) => typeof id === 'string')
+        : null;
+
+      const notes = raw.notes && typeof raw.notes === 'object' && !Array.isArray(raw.notes)
+        ? Object.fromEntries(
+          Object.entries(raw.notes)
+            .filter(([name, text]) => typeof name === 'string' && typeof text === 'string' && text.trim() !== ''),
+        )
+        : {};
+
+      const tags = raw.tags && typeof raw.tags === 'object' && !Array.isArray(raw.tags)
+        ? Object.fromEntries(
+          Object.entries(raw.tags)
+            .filter(([name, list]) => typeof name === 'string' && Array.isArray(list))
+            .map(([name, list]) => [
+              name,
+              list
+                .filter((tag) => tag && typeof tag === 'object' && typeof tag.text === 'string' && tag.text.trim())
+                .map((tag) => ({
+                  text: tag.text.trim().slice(0, 40),
+                  color: typeof tag.color === 'string' ? tag.color : 'gray',
+                })),
+            ])
+            .filter(([, list]) => list.length > 0),
+        )
+        : {};
+
+      // A slot with nothing usable in it is dropped rather than kept as a husk,
+      // so the menu's "is this slot empty?" test stays a single truthy check.
+      if (Object.keys(states).length === 0 && !groups && Object.keys(notes).length === 0) return acc;
+
+      acc[slot] = {
+        name: typeof raw.name === 'string' ? raw.name.trim().slice(0, 20) : '',
+        at: typeof raw.at === 'string' ? raw.at : '',
+        states,
+        components,
+        groups,
+        order,
+        notes,
+        tags,
+      };
+      return acc;
+    }, {}),
   };
 }
 
