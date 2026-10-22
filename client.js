@@ -22,10 +22,19 @@ window.__ModuleLoader__.load({
     const LAYOUT_STORE = 'dsh-plugin-groups.layout.v1';
 
     /**
-     * Build stamp shown in the toolbar. Bump this whenever the Client half
-     * changes so a stale page can be recognised immediately.
+     * Client build stamp. Bumped whenever the Client half changes, so a stale
+     * page is recognised at a glance instead of by guessing.
+     *
+     * This is NOT what the toolbar shows any more — the toolbar shows the real
+     * package version, which the Host serves from package.json. This constant
+     * stays as an internal marker (and appears in the title attribute of the
+     * version label) because it answers a different question: "did this page
+     * load the code I just edited?".
      */
-    const BUILD = '2026-10-21.02';
+    const BUILD = '2026-10-22.01';
+
+    /** Shown until the Host reports the package version. */
+    const VERSION_FALLBACK = '—';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must
@@ -37,6 +46,14 @@ window.__ModuleLoader__.load({
 
     /** The live Client context, set once by `apply`. */
     let liveCtx = null;
+
+    /**
+     * Package version reported by the Host, or '' when an older Host that does
+     * not send it is still running. Module-scoped rather than React state
+     * because it arrives inside `fetchLayout`, before the first render that
+     * needs it, and it never changes afterwards.
+     */
+    let pluginVersion = '';
 
     /** Group accent colours; decorative only, surfaces stay host-themed. */
     const ACCENTS = ['#4f86d6', '#3fa88a', '#c98a3f', '#9a6bd1', '#4aa3c7', '#c2607a', '#7d9a3f', '#b06a4a'];
@@ -270,7 +287,17 @@ window.__ModuleLoader__.load({
       try {
         const response = await fetch(LAYOUT_URL, { headers: { accept: 'application/json' } });
         if (!response.ok) throw new Error(String(response.status));
-        const stored = normalizeLayout(await response.json());
+        const payload = await response.json();
+        /*
+         * The Host rides the package version along with the layout. It is read
+         * BEFORE normalizeLayout, which only keeps fields it knows about and
+         * would otherwise drop it. An older Host that does not send the field
+         * leaves this empty, and the toolbar falls back instead of lying.
+         */
+        if (typeof payload?.pluginVersion === 'string' && payload.pluginVersion) {
+          pluginVersion = payload.pluginVersion;
+        }
+        const stored = normalizeLayout(payload);
         storageMode = 'file';
 
         const merged = {
@@ -393,6 +420,17 @@ window.__ModuleLoader__.load({
 
       /** Package name whose colour mark is being chosen. */
       const [marking, setMarking] = useState(null);
+
+      /**
+       * Search query. A blank string means "no filter", anything else puts the
+       * view in filter mode: only matching plugins and the groups holding them
+       * stay visible, and those groups force themselves open.
+       *
+       * Kept as one plain string rather than a structured filter object — the
+       * toolbar has one box, and every narrowing behaviour hangs off whether
+       * this is blank.
+       */
+      const [query, setQuery] = useState('');
 
       /** The tag being typed for one package: { name, text, color }. */
       const [tagDraft, setTagDraft] = useState(null);
@@ -1392,6 +1430,97 @@ window.__ModuleLoader__.load({
         return describeOf(bundle) || fallbackName || '';
       }, [layout.notes]);
 
+      // ------------------------------------------------------------------ search
+
+      /**
+       * Normalised query. `toLowerCase` alone is enough here: the plugin list is
+       * Chinese and ASCII, and folding case is what people expect from a search
+       * box. Leading/trailing spaces are dropped so a stray space never yields
+       * an empty result set — that looks like a bug to the user.
+       */
+      const needle = useMemo(() => query.trim().toLowerCase(), [query]);
+      const searching = needle.length > 0;
+
+      /**
+       * Everything about one bundle that the search box may match.
+       *
+       * Four groups, deliberately in the order the user thinks of them:
+       *   1. names       — what the row literally says (localised title, package)
+       *   2. note        — the user's own words, usually the most memorable
+       *   3. tags        — the labels they chose ("无损", "高消耗token")
+       *   4. description — the package's own blurb, so a half-remembered
+       *                    purpose still finds the plugin
+       *
+       * Built once per bundle and cached by name, because the same bundle is
+       * asked about by both the group renderer and the ungrouped list.
+       */
+      const haystackOf = useCallback((bundle, fallbackName) => {
+        const name = bundle?.name ?? fallbackName ?? '';
+        const parts = [
+          labelOf(bundle, fallbackName),
+          name,
+          (layout.notes ?? {})[name] ?? '',
+          describeOf(bundle),
+          ...(layout.tags ?? {})[name]?.map((tag) => tag.text) ?? [],
+        ];
+        return parts.join('\n').toLowerCase();
+      }, [layout.notes, layout.tags]);
+
+      /** Does this bundle match the current query? Always true when not searching. */
+      const bundleMatches = useCallback(
+        (bundle, fallbackName) => !searching || haystackOf(bundle, fallbackName).includes(needle),
+        [searching, haystackOf, needle],
+      );
+
+      /**
+       * The members of a group that survive the filter, with the group itself
+       * taken into account.
+       *
+       * A group name match wins over member matches: searching "浏览器" should
+       * reveal that whole group, not just the plugins inside it that happen to
+       * contain the word. That is the difference between finding a *place* and
+       * finding an *item*, and the group heading is a place.
+       */
+      const visibleMembersOf = useCallback((group) => {
+        const members = (group.members ?? []).filter((name) => groupedNames.has(name));
+        if (!searching) return members;
+        if ((group.name ?? '').toLowerCase().includes(needle)) return members;
+        return members.filter((name) => {
+          const bundle = bundleByName.get(name);
+          return bundle ? bundleMatches(bundle, name) : false;
+        });
+      }, [groupedNames, searching, needle, bundleByName, bundleMatches]);
+
+      /** Group is worth rendering when its own name matches or any member does. */
+      const groupVisible = useCallback((group) => {
+        if (!searching) return true;
+        if ((group.name ?? '').toLowerCase().includes(needle)) return true;
+        return visibleMembersOf(group).length > 0;
+      }, [searching, needle, visibleMembersOf]);
+
+      /** Ungrouped rows that survive the filter. */
+      const visibleUngrouped = useMemo(
+        () => (searching ? ungrouped.filter((bundle) => bundleMatches(bundle, bundle.name)) : ungrouped),
+        [searching, ungrouped, bundleMatches],
+      );
+
+      /** How many plugins the current query actually shows, for the empty state. */
+      const matchCount = useMemo(() => {
+        if (!searching) return listed.length;
+        let n = visibleUngrouped.length;
+        for (const group of groups) {
+          const byName = (group.name ?? '').toLowerCase().includes(needle);
+          for (const name of group.members ?? []) {
+            if (!groupedNames.has(name)) continue;
+            const bundle = bundleByName.get(name);
+            if (!bundle) continue;
+            if (byName || bundleMatches(bundle, name)) n += 1;
+          }
+        }
+        return n;
+      }, [searching, listed.length, visibleUngrouped.length, groups, groupedNames,
+        bundleByName, bundleMatches, needle]);
+
       const assignTo = useCallback((groupId, bundleName) => {
         applyLayout((prev) => {
           const target = (prev.groups ?? []).find((group) => group.id === groupId);
@@ -1755,9 +1884,25 @@ window.__ModuleLoader__.load({
       }
 
       function renderGroup(group) {
-        const isCollapsed = !isOpen(group.id);
-        const members = (group.members ?? []).filter((name) => groupedNames.has(name));
-        const onCount = members.filter((name) => bundleByName.get(name)?.enabled).length;
+        /*
+         * While searching, the row list is the filtered set and the group is
+         * forced open — a collapsed group would hide exactly the match the user
+         * is looking for, which is the one thing a search must never do. The
+         * user's own open/closed state is untouched: clearing the box restores
+         * it, because `isOpen` was never written to.
+         */
+        const isCollapsed = searching ? false : !isOpen(group.id);
+        const members = searching
+          ? visibleMembersOf(group)
+          : (group.members ?? []).filter((name) => groupedNames.has(name));
+        /*
+         * Counts stay on the FULL membership, not the filtered one. A search is
+         * a lens, not an edit: if it said "1 个插件" while filtering a six-member
+         * group down to one row, the group would look like it had lost plugins.
+         * The row list shows matches; the header still describes the group.
+         */
+        const allMembers = (group.members ?? []).filter((name) => groupedNames.has(name));
+        const onCount = allMembers.filter((name) => bundleByName.get(name)?.enabled).length;
         const isEditing = editing?.id === group.id;
         const locked = Boolean(group.locked);
         /*
@@ -2015,6 +2160,44 @@ window.__ModuleLoader__.load({
           key: 'reload', type: 'button', className: 'pgv-btn',
           onClick: () => { readInventory(); },
         }, '↻ 刷新'),
+        /*
+         * Search box. Placed right after the structural controls (new group,
+         * reload) and before the bulk ones, because its place in the reading
+         * order is "where am I" rather than "do something to everything".
+         *
+         * It is a controlled input rewritten on every keystroke. That is safe
+         * here: the list it filters re-renders but the input itself keeps its
+         * identity (same key, same position), so the caret stays put.
+         */
+        h('span', { key: 'searchwrap', className: 'pgv-search' }, [
+          h('span', { key: 'icon', className: 'pgv-search-icon' }, '⌕'),
+          h('input', {
+            key: 'input',
+            type: 'search',
+            className: 'pgv-search-input',
+            value: query,
+            placeholder: '搜插件、分组、标签、备注',
+            'aria-label': '搜索插件、分组、标签、备注',
+            title: '输入后只看匹配项；分组名匹配时整组显示',
+            onChange: (event) => setQuery(event.target.value),
+            onKeyDown: (event) => {
+              /* Esc clears the box; that is the one shortcut a search field owes. */
+              if (event.key === 'Escape') {
+                event.stopPropagation();
+                setQuery('');
+              }
+            },
+          }),
+          query
+            ? h('button', {
+              key: 'clear',
+              type: 'button',
+              className: 'pgv-search-clear',
+              title: '清空搜索',
+              onClick: () => setQuery(''),
+            }, '×')
+            : null,
+        ]),
         h('span', { key: 'sep', className: 'pgv-sep' }),
         /*
          * One button instead of two. Both directions in one control keeps the
@@ -2145,22 +2328,30 @@ window.__ModuleLoader__.load({
         ]),
         h('span', { key: 'grow', className: 'pgv-grow' }),
         /*
-         * Build stamp. It makes "is the page running the new code?" answerable at
-         * a glance instead of by guessing: this string changes with every build,
-         * so a stale page is immediately visible as an old stamp.
+         * Package version, served by the Host from package.json so there is one
+         * place to bump. The Client build stamp rides along in the tooltip: the
+         * version answers "which release is installed", the stamp answers "did
+         * the page load the code I just saved", and those are different
+         * questions that a single string could not answer without lying.
          */
         h('span', {
           key: 'build',
           className: 'pgv-hint pgv-build',
-          title: '页面当前运行的客户端代码版本',
-        }, 'v' + BUILD),
-        h('span', {
-          key: 'mode',
-          className: 'pgv-hint',
-          title: mode === 'file'
-            ? '分组存在 profile 目录的 plugin-groups.json，重启和清浏览器缓存都不会丢'
-            : '后端存档接口要重启 DSH 才生效，现在暂存在浏览器里',
-        }, mode === 'file' ? '存档：文件' : mode === 'local' ? '存档：浏览器' : ''),
+          title: `插件版本 ${pluginVersion || VERSION_FALLBACK}（客户端构建 ${BUILD}）`,
+        }, 'v' + (pluginVersion || VERSION_FALLBACK)),
+        /*
+         * Storage mode is only worth a label when it is NOT the normal case.
+         * "存档：文件" was pure reassurance on every single visit, and the
+         * normal case needs no reassurance — the abnormal one (data still in
+         * the browser because the Host half has not restarted yet) does.
+         */
+        mode === 'local'
+          ? h('span', {
+            key: 'mode',
+            className: 'pgv-hint pgv-build',
+            title: '后端存档接口要重启 DSH 才生效，现在暂存在浏览器里',
+          }, '暂存浏览器')
+          : null,
         h('span', { key: 'sum', className: 'pgv-hint' },
           phase === 'loading'
             ? '正在读取插件状态…'
@@ -2209,6 +2400,19 @@ window.__ModuleLoader__.load({
             : '插件清单读取失败。分组仍可编辑，但看不到真实开关状态。')
         : null;
 
+      /*
+       * What the body renders depends on three states, in this order:
+       *   1. no groups at all          -> the "create your first group" prompt
+       *   2. searching, nothing matched -> the no-results empty state
+       *   3. otherwise                 -> the visible groups, then ungrouped
+       *
+       * The no-results state exists because an empty page and an empty search
+       * look identical otherwise, and the user cannot tell whether the plugin
+       * broke or simply had no match.
+       */
+      const visibleGroups = searching ? groups.filter((group) => groupVisible(group)) : groups;
+      const noMatches = searching && matchCount === 0;
+
       return h('div', { className: 'pgv-root' }, [
         h('style', { key: 'css' }, CSS),
         header,
@@ -2217,12 +2421,16 @@ window.__ModuleLoader__.load({
         groups.length === 0
           ? h('p', { key: 'nogroups', className: 'pgv-empty' },
             '还没有分组。点「＋ 新建分组」开始，然后把下面的插件拖进去。')
-          : groups.map((group) => renderGroup(group)),
-        ungrouped.length > 0
+          : noMatches
+            ? h('p', { key: 'nomatch', className: 'pgv-empty' },
+              `没有匹配「${query.trim()}」的插件或分组。`)
+            : visibleGroups.map((group) => renderGroup(group)),
+        visibleUngrouped.length > 0
           ? h('section', { key: 'ungrouped', className: 'pgv-group is-ungrouped' }, [
             h('header', { key: 'head', className: 'pgv-head' }, [
               h('span', { key: 'accent', className: 'pgv-accent', style: { background: 'var(--dsw-alias-border-l2)' } }),
               h('span', { key: 'title', className: 'pgv-grouptitle is-static' }, '未分组'),
+              /* Count describes the group, not the lens — see renderGroup. */
               h('span', { key: 'count', className: 'pgv-count' }, String(ungrouped.length)),
               h('span', { key: 'grow', className: 'pgv-grow' }),
               h('span', { key: 'hint', className: 'pgv-hint' },
@@ -2230,7 +2438,7 @@ window.__ModuleLoader__.load({
                   ? '先新建一个分组，才能把插件分配进去'
                   : '用「分配到」选组，或直接把插件拖进上面的分组'),
             ]),
-            ungrouped.map((bundle) => {
+            visibleUngrouped.map((bundle) => {
               const tags = tagsOf(bundle.name);
               const row = h('div', {
                 key: 'row',
@@ -2364,6 +2572,48 @@ window.__ModuleLoader__.load({
   margin: 0 2px;
 }
 .pgv-hint { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+
+/*
+ * Search field. Sized to sit in the toolbar row without pushing the page stats
+ * off it: the bar already carries six controls, so this is deliberately a
+ * fixed, modest width rather than a flexible one. It grows a little on focus
+ * (see below) because that is when the user is typing and needs the room.
+ */
+.pgv-search {
+  display: inline-flex; align-items: center; gap: 6px;
+  width: 208px; flex: 0 0 auto;
+  padding: 0 8px 0 10px; border-radius: 9px;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  transition: width .16s ease, border-color .12s ease, background .12s ease;
+}
+.pgv-search:focus-within {
+  width: 268px;
+  background: var(--dsw-alias-bg-layer-1);
+  border-color: var(--dsw-alias-border-l2);
+}
+.pgv-search-icon {
+  font-size: 14px; line-height: 1; flex: 0 0 auto;
+  color: var(--dsw-alias-label-secondary);
+}
+.pgv-search-input {
+  /* The wrapper is the visible field, so the input itself is chrome-less. */
+  appearance: none; -webkit-appearance: none;
+  flex: 1 1 auto; min-width: 0;
+  font: inherit; font-size: 13px; line-height: 1;
+  padding: 8px 0; border: 0; outline: 0; background: transparent;
+  color: var(--dsw-alias-label-primary);
+}
+.pgv-search-input::placeholder { color: var(--dsw-alias-label-secondary); opacity: .85; }
+/* Chromium draws its own clear button for type=search; ours replaces it. */
+.pgv-search-input::-webkit-search-cancel-button { display: none; }
+.pgv-search-clear {
+  flex: 0 0 auto; font: inherit; font-size: 15px; line-height: 1;
+  width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%;
+  cursor: pointer; background: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-primary);
+}
+.pgv-search-clear:hover { background: var(--dsw-alias-border-l1); }
 
 .pgv-btn {
   font: inherit; font-size: 13px; line-height: 1;

@@ -13,9 +13,30 @@
 import { readFile, writeFile, mkdir, rename, access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 const ROUTE_PATH = '/plugin-groups/layout';
 const FILE_NAME = 'plugin-groups.json';
+
+/**
+ * This package's own version, read from its package.json.
+ *
+ * The Client half has no reliable way to know the installed version: the bundle
+ * is loaded into the page as a script and carries no metadata. The Host does
+ * have a real file path, so it reads the manifest once at module load and
+ * serves the value alongside the layout. One source of truth: bump
+ * package.json and the toolbar stamp follows.
+ */
+const PKG_VERSION = await (async () => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = await readFile(join(here, 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.version === 'string' ? parsed.version : '';
+  } catch {
+    return '';
+  }
+})();
 
 /** Own data folder under DSH_HOME, the convention every other plugin follows. */
 const DATA_DIR_NAME = 'dsh-plugin-groups';
@@ -281,7 +302,15 @@ export function apply(ctx) {
         }
         if (req.method === 'GET') {
           try {
-            sendJson(res, 200, await readLayout());
+            const layout = await readLayout();
+            /*
+             * `pluginVersion` rides along with the layout instead of getting a
+             * route of its own: the Client already polls this endpoint to pick
+             * up grouping changes, so one extra field costs no request. It is
+             * intentionally not part of the saved layout shape — writing it
+             * back is harmless because normalize() drops unknown fields.
+             */
+            sendJson(res, 200, { ...layout, pluginVersion: PKG_VERSION });
           } catch (error) {
             sendJson(res, 500, { error: String(error?.message ?? error) });
           }
