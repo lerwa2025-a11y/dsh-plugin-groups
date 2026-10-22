@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * Build stamp shown in the toolbar. Bump this whenever the Client half
      * changes so a stale page can be recognised immediately.
      */
-    const BUILD = '2026-10-20.04';
+    const BUILD = '2026-10-21.02';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must
@@ -372,6 +372,14 @@ window.__ModuleLoader__.load({
        * freezing.
        */
       const [applying, setApplying] = useState(null);
+
+      /**
+       * Group enable-all progress: { id, done, total } while one group's
+       * plugins are being switched on one Remote call at a time, null
+       * otherwise. Same reason as `applying`: the button beside the group has
+       * to say what it is doing instead of just freezing.
+       */
+      const [groupApplying, setGroupApplying] = useState(null);
 
       /** Which preset menu is open: null | 'save' | 'apply'. */
       const [presetMenu, setPresetMenu] = useState(null);
@@ -799,6 +807,95 @@ window.__ModuleLoader__.load({
           setBusy((prev) => { const next = { ...prev }; delete next[name]; return next; });
         }
       }, []);
+
+      /**
+       * Enable or disable every manageable plugin in one group, one Remote
+       * call each, in the direction the caller passes (`enabled`).
+       *
+       * The plan is built from the group's members, narrowed the same way
+       * `presetScope` narrows a preset's reach, because "one click for the
+       * whole group" must not become a back door around the same boundaries:
+       *   - the group itself is locked: the lock means "leave this alone", so
+       *     the render layer disables the button and this returns as a second
+       *     guard;
+       *   - a member of any other locked group is skipped — the lock is not
+       *     worked around by naming it twice;
+       *   - a member this view cannot switch (`lockReasonOf` set) or one that
+       *     is missing from the inventory is skipped rather than failed;
+       *   - a member already in the requested state is left alone, so a second
+       *     click is a harmless no-op.
+       *
+       * Calls are sequential on purpose, exactly like `applyPreset` pass 1: the
+       * official API writes through a patch file per call, and firing them in
+       * parallel is how a half-applied batch happens. Each success flips that
+       * bundle's `enabled` optimistically, so dots and the group count move as
+       * the loop runs; one read at the end reconciles the view with the real
+       * state instead of only the optimistic one.
+       */
+      const batchSetInGroup = useCallback(async (group, enabled) => {
+        const remote = pluginManagerRemote();
+        if (!remote) {
+          setNotice({ kind: 'error', text: '读不到官方插件管理接口，无法切换。' });
+          return;
+        }
+        if (!group || group.locked) return;
+        const lockedMembers = new Set();
+        for (const other of groups) {
+          if (!other.locked) continue;
+          for (const member of other.members ?? []) lockedMembers.add(member);
+        }
+        const plan = [];
+        for (const name of group.members ?? []) {
+          if (lockedMembers.has(name)) continue;
+          const bundle = bundleByName.get(name);
+          if (!bundle || bundle.enabled === undefined) continue;
+          if (lockReasonOf(bundle)) continue;
+          if (bundle.enabled === enabled) continue;
+          plan.push(bundle);
+        }
+        if (plan.length === 0) {
+          setNotice({ kind: 'ok', text: `「${group.name}」里的插件都已${enabled ? '启用' : '停用'}，没有需要改动的。` });
+          return;
+        }
+        setGroupApplying({ id: group.id, done: 0, total: plan.length, enabled });
+        setNotice(null);
+        let changed = 0;
+        let failed = 0;
+        let restart = false;
+        const step = () => setGroupApplying((prev) => (prev ? { ...prev, done: prev.done + 1 } : prev));
+        try {
+          for (const bundle of plan) {
+            setBusy((prev) => ({ ...prev, [bundle.name]: true }));
+            try {
+              const result = await remote.setBundleEnabled(bundle.name, enabled);
+              const application = result?.ok ? result.value?.application : null;
+              if (application === 'applied' || application === 'restart-required') {
+                changed += 1;
+                if (application === 'restart-required') restart = true;
+                setBundles((prev) => prev.map((entry) => (
+                  entry.name === bundle.name ? { ...entry, enabled } : entry
+                )));
+              } else {
+                failed += 1;
+              }
+            } catch {
+              failed += 1;
+            } finally {
+              setBusy((prev) => { const next = { ...prev }; delete next[bundle.name]; return next; });
+              step();
+            }
+          }
+        } finally {
+          setGroupApplying(null);
+        }
+        const parts = [`${enabled ? '已启用' : '已停用'}「${group.name}」里的 ${changed} 个插件`];
+        if (failed > 0) parts.push(`${failed} 个没改成（可能被更高优先级覆盖，或用不了）`);
+        if (restart) parts.push('部分改动要重启 DSH 才完全生效');
+        setNotice({ kind: failed > 0 ? 'warn' : 'ok', text: parts.join('，') + '。' });
+        // Re-read the official inventory so the dots and counts settle on the
+        // real state instead of only the optimistic one.
+        await readInventory();
+      }, [bundleByName, groups, lockReasonOf, readInventory]);
 
       // ------------------------------------------------------------- presets
 
@@ -1663,6 +1760,30 @@ window.__ModuleLoader__.load({
         const onCount = members.filter((name) => bundleByName.get(name)?.enabled).length;
         const isEditing = editing?.id === group.id;
         const locked = Boolean(group.locked);
+        /*
+         * What one 「全部启用」 click would still switch on: the members whose
+         * rows show a live, unguarded, not-yet-enabled toggle — the same plan
+         * `batchSetInGroup(group, true)` rebuilds. Zero means the click would be a no-op,
+         * so the button disables itself instead of clicking into nothing.
+         */
+        const enablePending = members.filter((name) => {
+          const bundle = bundleByName.get(name);
+          if (!bundle || bundle.enabled === undefined) return false;
+          if (lockReasonOf(bundle)) return false;
+          return bundle.enabled !== true;
+        }).length;
+        /*
+         * The mirror of enablePending for the 「全部停用」 button: the members
+         * whose rows show a live, unguarded, still-enabled toggle. Zero means
+         * a bulk disable would be a no-op, so that button disables itself and
+         * the two bulk buttons are never both alive at once.
+         */
+        const disablePending = members.filter((name) => {
+          const bundle = bundleByName.get(name);
+          if (!bundle || bundle.enabled === undefined) return false;
+          if (lockReasonOf(bundle)) return false;
+          return bundle.enabled === true;
+        }).length;
 
         return h('section', {
           key: group.id,
@@ -1775,6 +1896,50 @@ window.__ModuleLoader__.load({
               });
             })(),
             h('span', { key: 'grow', className: 'pgv-grow' }),
+            /*
+             * One-click enable for the whole group. The bulk toggle this header
+             * otherwise lacks: without it, turning a group on means clicking
+             * every row's switch by hand. It obeys the same boundaries as those
+             * rows — a locked group disables it like add/delete, members that
+             * cannot be switched are skipped, and an empty or already-on group
+             * disables it instead of clicking into a no-op.
+             */
+            iconButton('enableAll', '⚡', groupApplying?.id === group.id && groupApplying.enabled
+              ? `启用中 ${groupApplying.done}/${groupApplying.total}`
+              : '全部启用', {
+              title: locked
+                ? '已锁定的分组不能启停插件，请先解锁'
+                : groupApplying
+                  ? (groupApplying.id === group.id
+                    ? `正在${groupApplying.enabled ? '启用' : '停用'}这组里的插件：${groupApplying.done}/${groupApplying.total}`
+                    : `正在${groupApplying.enabled ? '启用' : '停用'}另一组的插件，等它跑完`)
+                  : enablePending === 0
+                    ? '这组里的插件都已启用（或没有可启用的插件）'
+                    : `把这组里还没启用的 ${enablePending} 个插件全部启用`,
+              disabled: locked || Boolean(groupApplying) || Boolean(applying) || enablePending === 0,
+              onClick: () => batchSetInGroup(group, true),
+            }),
+            /*
+             * The mirror bulk toggle: disable the whole group in one click.
+             * Same boundaries, same sequential calls, opposite direction. A
+             * group with nothing left enabled disables this instead of
+             * clicking into a no-op.
+             */
+            iconButton('disableAll', '⛔', groupApplying?.id === group.id && !groupApplying.enabled
+              ? `停用中 ${groupApplying.done}/${groupApplying.total}`
+              : '全部停用', {
+              title: locked
+                ? '已锁定的分组不能启停插件，请先解锁'
+                : groupApplying
+                  ? (groupApplying.id === group.id
+                    ? `正在${groupApplying.enabled ? '启用' : '停用'}这组里的插件：${groupApplying.done}/${groupApplying.total}`
+                    : `正在${groupApplying.enabled ? '启用' : '停用'}另一组的插件，等它跑完`)
+                  : disablePending === 0
+                    ? '这组里的插件都已停用（或没有可停用的插件）'
+                    : `把这组里还在启用的 ${disablePending} 个插件全部停用`,
+              disabled: locked || Boolean(groupApplying) || Boolean(applying) || disablePending === 0,
+              onClick: () => batchSetInGroup(group, false),
+            }),
             iconButton('add', '＋', '添加插件', {
               title: locked ? '已锁定的分组不能添加插件' : '从这个组里挑选要加入的插件',
               disabled: locked,

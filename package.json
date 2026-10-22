@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-plugin-groups",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DSH 插件分组视图：在「已安装插件」页新增分组/标签/备注/锁定标签页",
   "type": "module",
   "license": "MIT",
