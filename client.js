@@ -21,20 +21,16 @@ window.__ModuleLoader__.load({
     const LAYOUT_URL = '/plugin-groups/layout';
     const LAYOUT_STORE = 'dsh-plugin-groups.layout.v1';
 
-    /**
-     * Client build stamp. Bumped whenever the Client half changes, so a stale
-     * page is recognised at a glance instead of by guessing.
+    /*
+     * There is deliberately no version label in the toolbar any more.
      *
-     * This is NOT what the toolbar shows any more — the toolbar shows the real
-     * package version, which the Host serves from package.json. This constant
-     * stays as an internal marker (and appears in the title attribute of the
-     * version label) because it answers a different question: "did this page
-     * load the code I just edited?".
+     * It used to show the package version (served by the Host from
+     * package.json) plus a client build stamp in its tooltip. Both answered
+     * maintenance questions, not user questions: which release is installed is
+     * already visible in the official plugin page, and "did the page pick up my
+     * last edit" is answered by a reload. Walking into the settings page and
+     * being told a version number is noise, so the panel no longer carries one.
      */
-    const BUILD = '2026-10-22.01';
-
-    /** Shown until the Host reports the package version. */
-    const VERSION_FALLBACK = '—';
 
     /**
      * This bundle's own package name. A hard rule, not a heuristic: a plugin must
@@ -46,14 +42,6 @@ window.__ModuleLoader__.load({
 
     /** The live Client context, set once by `apply`. */
     let liveCtx = null;
-
-    /**
-     * Package version reported by the Host, or '' when an older Host that does
-     * not send it is still running. Module-scoped rather than React state
-     * because it arrives inside `fetchLayout`, before the first render that
-     * needs it, and it never changes afterwards.
-     */
-    let pluginVersion = '';
 
     /** Group accent colours; decorative only, surfaces stay host-themed. */
     const ACCENTS = ['#4f86d6', '#3fa88a', '#c98a3f', '#9a6bd1', '#4aa3c7', '#c2607a', '#7d9a3f', '#b06a4a'];
@@ -289,14 +277,10 @@ window.__ModuleLoader__.load({
         if (!response.ok) throw new Error(String(response.status));
         const payload = await response.json();
         /*
-         * The Host rides the package version along with the layout. It is read
-         * BEFORE normalizeLayout, which only keeps fields it knows about and
-         * would otherwise drop it. An older Host that does not send the field
-         * leaves this empty, and the toolbar falls back instead of lying.
+         * `pluginVersion` may still ride along on older Host builds; nothing in
+         * the page reads it any more (the version label is gone), and
+         * normalizeLayout drops unknown fields, so it is simply ignored.
          */
-        if (typeof payload?.pluginVersion === 'string' && payload.pluginVersion) {
-          pluginVersion = payload.pluginVersion;
-        }
         const stored = normalizeLayout(payload);
         storageMode = 'file';
 
@@ -315,6 +299,53 @@ window.__ModuleLoader__.load({
         storageMode = 'local';
         return local ?? EMPTY;
       }
+    }
+
+    /**
+     * Rebuild one snapshot group against the plugins that exist right now.
+     *
+     * Pure data, deliberately outside the component: it is the only part of a
+     * preset restore that can get the grouping wrong, so it is written to be
+     * verifiable without a browser (see the round-trip test used for the same
+     * purpose when the layout shape changed).
+     *
+     * Rules:
+     *   - a member that did not exist when the snapshot was taken is dropped
+     *     (it stays in 未分组, and `dropped` reports how many);
+     *   - a duplicate member is dropped rather than listed twice;
+     *   - a non-string member is ignored instead of trusted.
+     *
+     * `known` is the presence set: `present` when the slot has one, and the old
+     * switch map only as a fallback for slots saved before that field existed.
+     */
+    function rebaseGroup(group, known) {
+      const members = [];
+      const seen = new Set();
+      let dropped = 0;
+      for (const name of Array.isArray(group?.members) ? group.members : []) {
+        if (typeof name !== 'string' || seen.has(name)) continue;
+        seen.add(name);
+        if (!known.has(name)) { dropped += 1; continue; }
+        members.push(name);
+      }
+      return {
+        group: {
+          id: group.id,
+          name: typeof group.name === 'string' ? group.name : '未命名分组',
+          accent: typeof group.accent === 'string' ? group.accent : '',
+          members,
+          locked: Boolean(group.locked),
+        },
+        dropped,
+      };
+    }
+
+    /** The presence set a preset slot promises, newest field first. */
+    function presenceOf(preset) {
+      if (preset?.present && typeof preset.present === 'object') {
+        return new Set(Object.keys(preset.present));
+      }
+      return new Set(Object.keys(preset?.states ?? {}));
     }
 
     async function persistLayout(layout) {
@@ -850,9 +881,9 @@ window.__ModuleLoader__.load({
        * Enable or disable every manageable plugin in one group, one Remote
        * call each, in the direction the caller passes (`enabled`).
        *
-       * The plan is built from the group's members, narrowed the same way
-       * `presetScope` narrows a preset's reach, because "one click for the
-       * whole group" must not become a back door around the same boundaries:
+       * The plan is built from the group's members, narrowed so that "one click
+       * for the whole group" cannot become a back door around the security
+       * boundaries:
        *   - the group itself is locked: the lock means "leave this alone", so
        *     the render layer disables the button and this returns as a second
        *     guard;
@@ -863,11 +894,11 @@ window.__ModuleLoader__.load({
        *   - a member already in the requested state is left alone, so a second
        *     click is a harmless no-op.
        *
-       * Calls are sequential on purpose, exactly like `applyPreset` pass 1: the
-       * official API writes through a patch file per call, and firing them in
-       * parallel is how a half-applied batch happens. Each success flips that
-       * bundle's `enabled` optimistically, so dots and the group count move as
-       * the loop runs; one read at the end reconciles the view with the real
+       * Calls are sequential on purpose: the official API writes through a patch
+       * file per call, and firing them in parallel is how a half-applied batch
+       * happens. Each success flips that bundle's `enabled` optimistically, so
+       * dots and the group count move as the loop runs; one read at the end
+       * reconciles the view with the real
        * state instead of only the optimistic one.
        */
       const batchSetInGroup = useCallback(async (group, enabled) => {
@@ -877,6 +908,13 @@ window.__ModuleLoader__.load({
           return;
         }
         if (!group || group.locked) return;
+        /*
+         * A manual bulk click, unlike a preset restore, DOES honour group locks:
+         * a lock exists to stop an accidental click from flipping something that
+         * was carefully set up, and this button is exactly such a click. Members
+         * of any other locked group are skipped too — the lock must not be
+         * worked around by naming the plugin twice.
+         */
         const lockedMembers = new Set();
         for (const other of groups) {
           if (!other.locked) continue;
@@ -938,36 +976,47 @@ window.__ModuleLoader__.load({
       // ------------------------------------------------------------- presets
 
       /**
-       * The bundles a preset is allowed to record and restore.
+       * The bundles a preset may record and restore switches for.
        *
-       * Excluded, and the reason each one matters:
-       *   - this plugin itself: restoring it to "off" would kill the page that
-       *     is doing the restoring, and the tab would be left pointing at a
-       *     stopped plugin.
+       * This answers ONE question: can this plugin be switched through the
+       * official plugin manager at all? Excluded, and why each one matters:
+       *   - this plugin itself: restoring it to "off" would kill the page doing
+       *     the restoring, leaving the tab pointing at a stopped plugin.
        *   - `lockReasonOf(bundle)` set: missing packages, kernel rows the Host
-       *     owns, and unaddressable rows cannot be switched at all, so a preset
+       *     owns and unaddressable rows cannot be switched at all, so a preset
        *     that "restored" them would lie about what happened.
-       *   - members of a locked group: the lock means "leave this alone", so a
-       *     preset must not be a back door around it.
+       *
+       * A locked GROUP is deliberately NOT part of this filter.
+       *
+       * A group lock is a guard against accidental clicking: it greys out the
+       * per-row switch and the group's bulk enable/disable buttons so a stray
+       * click cannot flip something that was carefully set up. A preset snapshot
+       * is not a stray click — it is the user explicitly asking to put the page
+       * back the way it was. Excluding locked members here meant that a user who
+       * locked everything (the safest possible layout, and the one most worth
+       * snapshotting) saved a preset with an EMPTY switch map, so restoring it
+       * could only rebuild the grouping and could never turn a single plugin back
+       * on. Locking talks about the UI surface; this function talks about API
+       * capability; the two must not be mixed.
        */
-      const presetScope = useCallback(() => {
-        const lockedMembers = new Set();
-        for (const group of groups) {
-          if (!group.locked) continue;
-          for (const member of group.members ?? []) lockedMembers.add(member);
-        }
-        return listed.filter((bundle) => (
-          bundle?.name
-          && bundle.enabled !== undefined
-          && !lockReasonOf(bundle)
-          && !lockedMembers.has(bundle.name)
-        ));
-      }, [groups, listed, lockReasonOf]);
+      const presetScope = useCallback(() => listed.filter((bundle) => (
+        bundle?.name
+        && bundle.enabled !== undefined
+        && !lockReasonOf(bundle)
+      )), [listed, lockReasonOf]);
 
       /**
-       * Everything a preset records, in one place so save and apply cannot drift
-       * apart. Components are keyed by `entryId` rather than `rowId`: rowIds are
-       * local to a bundle, entryIds are what `setPluginEnabled` actually takes.
+       * Everything a preset records.
+       *
+       * A preset is a full snapshot of "how the plugin page was": the switches,
+       * the grouping, the component switches, and the user's notes and tags.
+       * Restoring it must bring all of that back — a plugin that was on when the
+       * slot was saved has to be on again afterwards. That is the whole point of
+       * the feature, and the progress bar exists exactly because restoring a
+       * busy preset means enabling a lot of plugins one Remote call at a time.
+       *
+       * Components are keyed by `entryId` rather than `rowId`: rowIds are local
+       * to a bundle, entryIds are what `setPluginEnabled` actually takes.
        */
       const snapshotOf = useCallback(() => {
         const states = {};
@@ -987,14 +1036,13 @@ window.__ModuleLoader__.load({
          * `present` records every plugin that exists on this page, which is a
          * different set from `states`.
          *
-         * `states` only covers what a preset is allowed to switch: unlocking a
-         * group or the plugin itself is a safety boundary, so locked members and
-         * unswitchable plugins never appear there. Rebuilding the grouping from
-         * `states` alone then treats those very members as "did not exist when
-         * the snapshot was taken" and drops them out of their groups — which is
-         * how applying a preset used to scatter most of a locked layout into
-         * 未分组. Presence and switchability are separate questions; this field
-         * answers presence.
+         * `states` only covers what a preset is allowed to switch: this plugin
+         * itself and unswitchable rows (kernel, missing, unaddressable) never
+         * appear there. Rebuilding the grouping from `states` alone would then
+         * treat those very members as "did not exist when the snapshot was
+         * taken" and drop them out of their groups — which is how applying a
+         * preset used to scatter most of a locked layout into 未分组. Presence
+         * and switchability are separate questions; this field answers presence.
          */
         const present = Object.fromEntries(listed.filter((bundle) => bundle?.name).map((bundle) => [bundle.name, true]));
         return {
@@ -1016,7 +1064,7 @@ window.__ModuleLoader__.load({
         };
       }, [componentPartsOf, layout.groups, layout.notes, layout.order, layout.tags, pluginRows, presetScope, listed]);
 
-      /** Save the current state (switches, groups, components, notes, tags). */
+      /** Save the current switches, grouping, notes and tags. */
       const savePreset = useCallback((slot) => {
         const snap = snapshotOf();
         const count = Object.keys(snap.states).length;
@@ -1050,28 +1098,27 @@ window.__ModuleLoader__.load({
       }, [applyLayout, layout.presets, snapshotOf]);
 
       /**
-       * Apply one slot. Four passes, in this order, because the later ones depend
-       * on the earlier ones being settled:
+       * Restore one slot: plugin switches, component switches, grouping, notes
+       * and tags. Three passes, in this order, because the later ones depend on
+       * the earlier ones being settled:
        *
        *   1. plugin switches — the bulk of the work, one Remote call each
-       *   2. component switches — only for bundles the preset left ON, since a
+       *   2. component switches — only for bundles the preset leaves ON, since a
        *      disabled bundle has no running parts to restore
-       *   3. group structure — replaces groups/order wholesale, but only for
-       *      plugins that were present when the snapshot was taken, so anything
-       *      installed since stays in 未分组 instead of being swallowed
-       *   4. notes and tags — pure data, no Remote calls, applied last
+       *   3. group structure + notes + tags — local data, applied last
        *
-       * Remote calls are sequential on purpose: the official API writes through a
-       * patch file per call, and firing thirty writes at once is how a
-       * half-applied preset happens. Everything the user needs to hear is
-       * collected and reported once at the end rather than flooding the notice bar.
+       * The progress bar is driven by the real work, not by a timer: every single
+       * Remote call advances it, so restoring a preset that turns on thirty
+       * plugins shows thirty steps instead of a frozen panel. Remote calls are
+       * sequential on purpose — the official API writes through a patch file per
+       * call, and firing them all at once is how a half-applied preset happens.
        */
       const applyPreset = useCallback(async (slot) => {
         const preset = (layout.presets ?? {})[slot];
         if (!preset) return;
         const remote = pluginManagerRemote();
         if (!remote) {
-          setNotice({ kind: 'error', text: '读不到官方插件管理接口，没法应用预设。' });
+          setNotice({ kind: 'error', text: '读不到官方插件管理接口，没法恢复预设。' });
           return;
         }
 
@@ -1085,7 +1132,7 @@ window.__ModuleLoader__.load({
         }
 
         // --- pass 2: component switches ----------------------------------
-        // Only rows we can address, only bundles the preset turns on, and only
+        // Only rows we can address, only bundles the preset leaves on, and only
         // where the live row disagrees with the snapshot.
         const componentPlan = [];
         for (const bundle of scope) {
@@ -1104,149 +1151,191 @@ window.__ModuleLoader__.load({
           }
         }
 
+        const snapGroups = Array.isArray(preset.groups) ? preset.groups : null;
+        const notes = preset.notes ?? {};
+        const tags = preset.tags ?? {};
+        const hasAnnotations = Object.keys(notes).length > 0 || Object.keys(tags).length > 0;
         const total = switchPlan.length + componentPlan.length;
-        const hasLayoutWork = Boolean(preset.groups)
-          || Object.keys(preset.notes ?? {}).length > 0
-          || Object.keys(preset.tags ?? {}).length > 0;
-        if (total === 0 && !hasLayoutWork) {
+
+        /*
+         * "Nothing to do" has to be judged on the whole preset, not just the
+         * switches: a slot whose grouping and notes already match should say so
+         * instead of reporting "changed 0 switches" as if it had worked through
+         * a list. Comparing the saved layout against the live one here keeps the
+         * message honest.
+         */
+        const layoutAlreadyMatches = !snapGroups || (
+          (layout.groups ?? []).length === snapGroups.length
+          && snapGroups.every((saved, index) => {
+            const live = (layout.groups ?? [])[index];
+            if (!live || live.id !== saved.id) return false;
+            if (live.name !== saved.name) return false;
+            if (Boolean(live.locked) !== Boolean(saved.locked)) return false;
+            const savedMembers = (saved.members ?? []).join('\u0000');
+            const liveMembers = (live.members ?? []).join('\u0000');
+            return savedMembers === liveMembers;
+          })
+          && (layout.order ?? []).join('\u0000') === (preset.order ?? []).join('\u0000')
+        );
+        const annotationsAlreadyMatch = !hasAnnotations || (
+          JSON.stringify(layout.notes ?? {}) === JSON.stringify(notes)
+          && JSON.stringify(layout.tags ?? {}) === JSON.stringify(tags)
+        );
+        if (total === 0 && layoutAlreadyMatches && annotationsAlreadyMatch) {
           setNotice({ kind: 'ok', text: '当前状态和这个预设一致，不需要改动。' });
           return;
         }
 
         // --- confirm before doing anything destructive -------------------
-        // Applying a preset with a group snapshot replaces the whole grouping.
-        // Say so up front, with numbers, instead of discovering it afterwards.
-        if (preset.groups) {
+        const willTurnOn = switchPlan.filter((name) => preset.states[name] === true).length;
+        const willTurnOff = switchPlan.length - willTurnOn;
+        if (snapGroups || total > 0) {
           const lines = [
-            `应用${presetLabel(preset, slot)}会做这些事：`,
-            `· 改 ${total} 处开关（${switchPlan.length} 个插件、${componentPlan.length} 个组件）`,
-            `· 用预设里的 ${preset.groups.length} 个分组覆盖现在的 ${(layout.groups ?? []).length} 个分组`,
-            '',
-            '现在新建的分组会被替换掉。预设之后新装的插件不会被放进任何组，会留在「未分组」。',
+            `恢复${presetLabel(preset, slot)}会做这些事：`,
+            `· 改 ${total} 处开关（启用 ${willTurnOn} 个插件、停用 ${willTurnOff} 个，组件 ${componentPlan.length} 个）`,
           ];
+          if (snapGroups) {
+            lines.push(`· 用预设里的 ${snapGroups.length} 个分组覆盖现在的 ${(layout.groups ?? []).length} 个分组`);
+          }
+          if (hasAnnotations) lines.push('· 恢复备注和标签');
+          lines.push('');
+          lines.push('开着的插件会被打开、关着的会被关掉，完全回到存预设那一刻的样子。');
+          if (snapGroups) {
+            lines.push('现在新建的分组会被替换掉；预设之后新装的插件会留在「未分组」。');
+          }
           if (!window.confirm(lines.join('\n'))) return;
         }
 
-        setApplying({ slot, done: 0, total });
+        const startedAt = Date.now();
+        setApplying({ slot, done: 0, total, label: '', phase: 'switches' });
         setNotice(null);
+
+        /** Yield to the browser so the progress bar actually paints. */
+        const tick = () => new Promise((resolve) => setTimeout(resolve, 16));
+        const step = (label) => setApplying((prev) => (prev
+          ? { ...prev, done: prev.done + 1, label }
+          : prev));
+
         let changed = 0;
         let failed = 0;
         let restart = false;
 
-        const step = () => setApplying((prev) => (prev ? { ...prev, done: prev.done + 1 } : prev));
-
-        try {
-          for (const name of switchPlan) {
-            setBusy((prev) => ({ ...prev, [name]: true }));
-            try {
-              const result = await remote.setBundleEnabled(name, preset.states[name]);
-              const application = result?.ok ? result.value?.application : null;
-              if (application === 'applied' || application === 'restart-required') {
-                changed += 1;
-                if (application === 'restart-required') restart = true;
-                setBundles((prev) => prev.map((bundle) => (
-                  bundle.name === name ? { ...bundle, enabled: preset.states[name] } : bundle
-                )));
-              } else {
-                failed += 1;
-              }
-            } catch {
+        // --- pass 1: plugin switches, one Remote call each ---------------
+        for (const name of switchPlan) {
+          const bundle = bundleByName.get(name);
+          const shown = bundle ? labelOf(bundle, name) : name;
+          const on = preset.states[name];
+          setApplying((prev) => (prev ? { ...prev, label: `${on ? '启用' : '停用'}「${shown}」` } : prev));
+          setBusy((prev) => ({ ...prev, [name]: true }));
+          try {
+            const result = await remote.setBundleEnabled(name, on);
+            const application = result?.ok ? result.value?.application : null;
+            if (application === 'applied' || application === 'restart-required') {
+              changed += 1;
+              if (application === 'restart-required') restart = true;
+              setBundles((prev) => prev.map((entry) => (
+                entry.name === name ? { ...entry, enabled: on } : entry
+              )));
+            } else {
               failed += 1;
-            } finally {
-              setBusy((prev) => { const next = { ...prev }; delete next[name]; return next; });
-              step();
             }
+          } catch {
+            failed += 1;
+          } finally {
+            setBusy((prev) => { const next = { ...prev }; delete next[name]; return next; });
+            step(`${on ? '启用' : '停用'}「${shown}」`);
+            await tick();
           }
-
-          for (const item of componentPlan) {
-            try {
-              const result = await remote.setPluginEnabled(item.entryId, item.on);
-              const application = result?.ok ? result.value?.application : null;
-              if (application === 'applied' || application === 'restart-required') {
-                changed += 1;
-                if (application === 'restart-required') restart = true;
-                setPluginRows((prev) => (
-                  prev[item.entryId] ? { ...prev, [item.entryId]: { ...prev[item.entryId], enabled: item.on } } : prev
-                ));
-              } else {
-                failed += 1;
-              }
-            } catch {
-              failed += 1;
-            } finally {
-              step();
-            }
-          }
-        } finally {
-          setApplying(null);
         }
 
-        // --- pass 3 + 4: group structure, notes, tags --------------------
+        // --- pass 2: component switches ----------------------------------
+        for (const item of componentPlan) {
+          setApplying((prev) => (prev
+            ? { ...prev, phase: 'components', label: `${item.on ? '启用' : '停用'}「${item.bundle}」的组件` }
+            : prev));
+          try {
+            const result = await remote.setPluginEnabled(item.entryId, item.on);
+            const application = result?.ok ? result.value?.application : null;
+            if (application === 'applied' || application === 'restart-required') {
+              changed += 1;
+              if (application === 'restart-required') restart = true;
+              setPluginRows((prev) => (
+                prev[item.entryId] ? { ...prev, [item.entryId]: { ...prev[item.entryId], enabled: item.on } } : prev
+              ));
+            } else {
+              failed += 1;
+            }
+          } catch {
+            failed += 1;
+          } finally {
+            step(`${item.on ? '启用' : '停用'}「${item.bundle}」的组件`);
+            await tick();
+          }
+        }
+
+        // --- pass 3: group structure, then notes and tags ----------------
+        /*
+         * Rebuild the grouping from the snapshot, but drop every member that did
+         * not exist when the snapshot was taken. Those plugins keep no
+         * membership, which is exactly how they end up in 未分组 — the page
+         * derives that section from "listed but not in any group".
+         */
+        const known = presenceOf(preset);
         let keptOut = 0;
-        if (preset.groups) {
-          /*
-           * Rebuild the grouping from the snapshot, but drop every member that
-           * did not exist when the snapshot was taken. Those plugins keep no
-           * membership, which is exactly how they end up in 未分组 — the page
-           * derives that section from "listed but not in any group".
-           *
-           * Presence comes from `present` when the slot has one. Older slots
-           * predate that field, so they fall back to `states` and keep their old
-           * (narrower) behaviour rather than failing to load.
-           */
-          const known = new Set(
-            preset.present && typeof preset.present === 'object'
-              ? Object.keys(preset.present)
-              : Object.keys(preset.states ?? {}),
-          );
-          const groups = preset.groups.map((group) => {
-            const members = (group.members ?? []).filter((name) => {
-              if (known.has(name)) return true;
-              keptOut += 1;
-              return false;
-            });
-            return {
-              id: group.id,
-              name: group.name,
-              accent: group.accent ?? '',
-              members,
-              locked: Boolean(group.locked),
-            };
-          });
-          const groupIds = new Set(groups.map((group) => group.id));
-          const order = (preset.order ?? []).filter((id) => groupIds.has(id));
-          for (const group of groups) {
-            if (!order.includes(group.id)) order.push(group.id);
-          }
-          applyLayout((prev) => ({
-            ...prev,
-            groups,
-            order,
-            notes: { ...(preset.notes ?? {}) },
-            tags: JSON.parse(JSON.stringify(preset.tags ?? {})),
-          }));
-        } else {
-          // No group snapshot in this slot (saved by an older build): restore
-          // only the annotations, and leave the grouping untouched.
-          applyLayout((prev) => ({
-            ...prev,
-            notes: { ...(preset.notes ?? {}) },
-            tags: JSON.parse(JSON.stringify(preset.tags ?? {})),
-          }));
+        const nextGroups = [];
+        for (const group of snapGroups ?? []) {
+          const rebased = rebaseGroup(group, known);
+          keptOut += rebased.dropped;
+          nextGroups.push(rebased.group);
         }
+
+        setApplying((prev) => (prev ? { ...prev, phase: 'layout', label: '分组与备注' } : prev));
+        applyLayout((prev) => {
+          const next = {
+            ...prev,
+            notes: { ...notes },
+            tags: JSON.parse(JSON.stringify(tags)),
+          };
+          if (snapGroups) {
+            const groupIds = new Set(nextGroups.map((group) => group.id));
+            const order = (preset.order ?? []).filter((id) => groupIds.has(id));
+            for (const group of nextGroups) {
+              if (!order.includes(group.id)) order.push(group.id);
+            }
+            next.groups = nextGroups;
+            next.order = order;
+          }
+          return next;
+        });
         setOpenGroups({});
 
-        const parts = [`已应用${presetLabel(preset, slot)}：改了 ${changed} 处开关`];
-        if (preset.groups) parts.push(`分组已换成预设里的 ${preset.groups.length} 个`);
-        if (keptOut > 0) parts.push(`${keptOut} 个后来新装的插件留在「未分组」`);
+        // --- hold the bar long enough to read, then retire it -----------
+        const minVisible = total > 0 ? 0 : 520;
+        const remaining = minVisible - (Date.now() - startedAt);
+        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+        setApplying(null);
+
+        // Re-read the official inventory so the dots and counts settle on the
+        // real state instead of only the optimistic one.
+        await readInventory();
+
+        const parts = [`已恢复${presetLabel(preset, slot)}：改了 ${changed} 处开关`];
+        if (snapGroups) parts.push(`分组换成预设里的 ${nextGroups.length} 个`);
+        if (hasAnnotations) {
+          parts.push(`${Object.keys(notes).length} 条备注、${Object.keys(tags).length} 组标签`);
+        }
+        if (keptOut > 0) parts.push(`${keptOut} 个已不在的插件没有放回分组`);
         if (failed > 0) parts.push(`${failed} 处没改成（可能被更高优先级覆盖，或用不了）`);
         if (restart) parts.push('部分改动要重启 DSH 才完全生效');
         setNotice({ kind: failed > 0 ? 'warn' : 'ok', text: parts.join('，') + '。' });
-      }, [applyLayout, layout.groups, layout.presets, pluginRows, presetScope]);
+      }, [
+        applyLayout, bundleByName, layout.groups, layout.presets, pluginRows,
+        presetScope, readInventory,
+      ]);
 
       /**
-       * What applying a slot would change, without changing anything. Used by the
-       * menu so the label can say how much work a click is worth.
+       * What restoring a slot would change, without changing anything. Used by
+       * the menu so the label says how much work a click is worth.
        */
       const presetImpact = useCallback((preset) => {
         if (!preset) return null;
@@ -1266,7 +1355,9 @@ window.__ModuleLoader__.load({
         return {
           switches,
           components,
-          groups: preset.groups ? preset.groups.length : null,
+          groups: Array.isArray(preset.groups) ? preset.groups.length : null,
+          notes: Object.keys(preset.notes ?? {}).length,
+          tags: Object.keys(preset.tags ?? {}).length,
           total: switches + components,
         };
       }, [pluginRows, presetScope]);
@@ -2236,7 +2327,7 @@ window.__ModuleLoader__.load({
           h('button', {
             key: 'btn', type: 'button',
             className: 'pgv-btn' + (presetMenu === 'save' ? ' is-open' : ''),
-            title: '把现在所有插件的开/关状态存成一个快照，之后可以一键恢复',
+            title: '把现在的开关状态和分组存成一个快照，之后可以一键恢复',
             disabled: Boolean(applying),
             onClick: () => setPresetMenu(presetMenu === 'save' ? null : 'save'),
           }, [
@@ -2246,16 +2337,17 @@ window.__ModuleLoader__.load({
           presetMenu === 'save'
             ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
               const preset = (layout.presets ?? {})[slot];
+              const savedOn = Object.values(preset?.states ?? {}).filter(Boolean).length;
               return h('button', {
                 key: slot, type: 'button', className: 'pgv-menu-item',
                 title: preset
-                  ? `覆盖保存：现在是 ${Object.values(preset.states).filter(Boolean).length} 开 / ${Object.values(preset.states).filter((v) => !v).length} 关，${(preset.groups ?? []).length} 个分组`
+                  ? `覆盖保存：现在是 ${(layout.groups ?? []).length} 个分组，槽位里存的是 ${savedOn} 开、${(preset.groups ?? []).length} 个分组`
                   : '这个槽位还空着',
                 onClick: () => { savePreset(slot); setPresetMenu(null); },
               }, [
                 h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
                 h('span', { key: 's', className: 'pgv-menu-sub' }, preset
-                  ? `${Object.values(preset.states).filter(Boolean).length} 开 · ${(preset.groups ?? []).length} 组`
+                  ? `${savedOn} 开 · ${(preset.groups ?? []).length} 组`
                   : '空'),
               ]);
             }))
@@ -2265,12 +2357,12 @@ window.__ModuleLoader__.load({
           h('button', {
             key: 'btn', type: 'button',
             className: 'pgv-btn' + (presetMenu === 'apply' ? ' is-open' : ''),
-            title: '把插件开关一键改成某个预设里存的样子',
+            title: '把开关和分组恢复成某个预设里存的样子',
             disabled: Boolean(applying),
             onClick: () => setPresetMenu(presetMenu === 'apply' ? null : 'apply'),
           }, [
             h('span', { key: 'g', className: 'pgv-btn-glyph' }, '⚡'),
-            h('span', { key: 'l' }, applying ? `应用中 ${applying.done}/${applying.total}` : '应用预设'),
+            h('span', { key: 'l' }, applying ? `恢复中 ${applying.done}/${applying.total}` : '恢复预设'),
           ]),
           presetMenu === 'apply'
             ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
@@ -2282,15 +2374,16 @@ window.__ModuleLoader__.load({
                   className: 'pgv-menu-item' + (preset ? '' : ' is-empty'),
                   disabled: !preset,
                   /*
-                   * The label says how much this click costs, not just which slot
-                   * it is. "应用 预设1" is a promise; "预设1  3插件·8组件·8组" is
-                   * measurable, and the difference matters when a slot rewrites
-                   * the whole grouping.
+                   * The label says how much this click changes, not just which
+                   * slot it is. "恢复 预设1" is a promise; "8组 · 36插件 · 改12处开关"
+                   * is measurable, and the difference matters when a click both
+                   * flips a dozen switches and rewrites the whole grouping.
                    */
                   title: preset
                     ? [
-                      `用这个预设：改 ${impact.switches} 个插件开关、${impact.components} 个组件`,
-                      impact.groups === null ? '（这份预设没有存分组）' : `分组会换成预设里的 ${impact.groups} 个`,
+                      `用来恢复：会改 ${impact.switches} 个插件开关、${impact.components} 个组件`,
+                      impact.groups === null ? '（这份预设没有存分组）' : `分组换成预设里的 ${impact.groups} 个`,
+                      `备注 ${impact.notes} 条 · 标签 ${impact.tags} 组`,
                     ].join('\n')
                     : '这个槽位还没存过东西',
                   onClick: () => {
@@ -2301,9 +2394,8 @@ window.__ModuleLoader__.load({
                   h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
                   h('span', { key: 's', className: 'pgv-menu-sub' }, preset
                     ? [
-                      `${impact.switches}插件`,
+                      impact.switches > 0 ? `改${impact.switches}开关` : '开关一致',
                       impact.groups === null ? null : `${impact.groups}组`,
-                      impact.components > 0 ? `${impact.components}组件` : null,
                     ].filter(Boolean).join(' · ')
                     : '空'),
                 ]),
@@ -2328,27 +2420,15 @@ window.__ModuleLoader__.load({
         ]),
         h('span', { key: 'grow', className: 'pgv-grow' }),
         /*
-         * Package version, served by the Host from package.json so there is one
-         * place to bump. The Client build stamp rides along in the tooltip: the
-         * version answers "which release is installed", the stamp answers "did
-         * the page load the code I just saved", and those are different
-         * questions that a single string could not answer without lying.
-         */
-        h('span', {
-          key: 'build',
-          className: 'pgv-hint pgv-build',
-          title: `插件版本 ${pluginVersion || VERSION_FALLBACK}（客户端构建 ${BUILD}）`,
-        }, 'v' + (pluginVersion || VERSION_FALLBACK)),
-        /*
-         * Storage mode is only worth a label when it is NOT the normal case.
-         * "存档：文件" was pure reassurance on every single visit, and the
-         * normal case needs no reassurance — the abnormal one (data still in
-         * the browser because the Host half has not restarted yet) does.
+         * No version label here: which release is installed is the official
+         * plugin page's job, and a version number in a working panel is noise.
+         * Storage mode still keeps its label because that one is only shown when
+         * something is actually wrong.
          */
         mode === 'local'
           ? h('span', {
             key: 'mode',
-            className: 'pgv-hint pgv-build',
+            className: 'pgv-hint',
             title: '后端存档接口要重启 DSH 才生效，现在暂存在浏览器里',
           }, '暂存浏览器')
           : null,
@@ -2373,6 +2453,41 @@ window.__ModuleLoader__.load({
               }, `未分组 ${ungrouped.length}`),
             ]),
       ]);
+
+      /*
+       * Restore progress. A real progress bar rather than a "working…" label:
+       * a preset can carry a lot of groups, and the restore walks them one by
+       * one, so the user gets a measured "where is it" answer instead of a
+       * frozen toolbar. It sits under the notice slot, spans the panel width,
+       * and announces itself politely to assistive tech.
+       */
+      const progressEl = applying
+        ? h('div', {
+          key: 'progress',
+          className: 'pgv-progress',
+          role: 'progressbar',
+          'aria-valuemin': 0,
+          'aria-valuemax': applying.total,
+          'aria-valuenow': applying.done,
+          'aria-label': '恢复预设进度',
+        }, [
+          h('div', { key: 'line', className: 'pgv-progress-line' }, [
+            h('span', { key: 'text', className: 'pgv-progress-text' },
+              `正在恢复${presetLabel((layout.presets ?? {})[applying.slot], applying.slot)}`
+              + (applying.label ? `：${applying.label}` : '…')),
+            h('span', { key: 'pct', className: 'pgv-progress-pct' },
+              `${applying.total === 0 ? 100 : Math.round((applying.done / applying.total) * 100)}%`),
+          ]),
+          h('div', { key: 'track', className: 'pgv-progress-track' },
+            h('span', {
+              key: 'fill',
+              className: 'pgv-progress-fill',
+              style: {
+                width: `${applying.total === 0 ? 100 : Math.round((applying.done / applying.total) * 100)}%`,
+              },
+            })),
+        ])
+        : null;
 
       const noticeEl = notice
         ? h('div', {
@@ -2416,6 +2531,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'pgv-root' }, [
         h('style', { key: 'css' }, CSS),
         header,
+        progressEl,
         noticeEl,
         blocked,
         groups.length === 0
@@ -3147,6 +3263,41 @@ window.__ModuleLoader__.load({
 .pgv-notice.is-error { border-color: var(--dsw-alias-state-error-primary); }
 .pgv-notice.is-warn { border-color: var(--dsw-alias-state-warn-primary); }
 .pgv-notice.is-ok { border-color: var(--dsw-alias-state-success-primary); }
+/*
+ * Restore-progress bar. Two lines: what it is doing (with the percentage on the
+ * right) and a track with a fill. The fill animates its width, so a series of
+ * quick steps reads as steady movement instead of a jump; the transition is
+ * short enough that the last step still lands visibly.
+ */
+.pgv-progress {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-bg-layer-2);
+}
+.pgv-progress-line {
+  display: flex; align-items: baseline; gap: 10px;
+  font-size: 12.5px;
+}
+.pgv-progress-text {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+}
+.pgv-progress-pct {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-secondary);
+}
+.pgv-progress-track {
+  height: 6px; border-radius: 999px; overflow: hidden;
+  background: var(--dsw-alias-border-l1);
+}
+.pgv-progress-fill {
+  display: block; height: 100%; border-radius: 999px;
+  background: var(--dsw-alias-brand-primary);
+  transition: width .18s ease;
+}
 /* Incident notice shown when the view itself fails to render. */
 .pgv-crash {
   padding: 16px; border-radius: 10px; font-size: 13px; line-height: 1.7;
