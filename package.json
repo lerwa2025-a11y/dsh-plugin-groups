@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-groups",
-  "version": "0.3.2",
-  "description": "DSH 插件分组视图：在「已安装插件」页新增分组/标签/备注/锁定标签页",
+  "version": "0.4.0",
+  "description": "DSH 插件分组视图：在「已安装插件」页新增分组/标签/备注/锁定标签页，预设可任意多份并存",
   "type": "module",
   "license": "MIT",
   "author": "lerwa",

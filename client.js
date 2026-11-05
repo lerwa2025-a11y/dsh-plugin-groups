@@ -73,11 +73,29 @@ window.__ModuleLoader__.load({
     const EMPTY = { version: 1, groups: [], order: [], notes: {}, tags: {}, presets: {} };
 
     /**
-     * Fixed preset slots. Exactly two, as asked: one for "work mode", one for
-     * "quiet mode" — the names are the user's to change, the ids are not, so a
-     * saved preset never becomes orphaned by a rename.
+     * Preset ids.
+     *
+     * v0.4: presets are no longer a fixed pair. There can be as many as the user
+     * wants, so the id is generated when a preset is created and never changes
+     * afterwards — renaming only touches `name`. That keeps a saved preset from
+     * being orphaned by a rename, which was the whole reason the old code pinned
+     * the ids to `p1`/`p2`.
+     *
+     * Ordering is the object key order of `layout.presets`. All ids start with a
+     * letter (`p…`), never a digit, so JS keeps insertion order for them instead
+     * of re-sorting numerically.
      */
-    const PRESET_SLOTS = ['p1', 'p2'];
+    const PRESET_ID_PREFIX = 'p';
+
+    /** 生成一个不与现有预设冲突的 id。 */
+    function newPresetId(existing) {
+      const taken = new Set(Object.keys(existing && typeof existing === 'object' ? existing : {}));
+      let id = '';
+      do {
+        id = `${PRESET_ID_PREFIX}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      } while (taken.has(id));
+      return id;
+    }
 
     // ------------------------------------------------------------ remote/data
 
@@ -180,7 +198,11 @@ window.__ModuleLoader__.load({
         ? source.presets
         : {};
       const presets = {};
-      for (const slot of PRESET_SLOTS) {
+      /*
+       * v0.4: iterate every key, not a fixed list. Old files only contain p1/p2
+       * and load exactly as before; new files may contain any number of ids.
+       */
+      for (const slot of Object.keys(rawPresets)) {
         const raw = rawPresets[slot];
         if (!raw || typeof raw !== 'object') continue;
         const boolMap = (value) => {
@@ -441,6 +463,19 @@ window.__ModuleLoader__.load({
 
       /** Which preset menu is open: null | 'save' | 'apply'. */
       const [presetMenu, setPresetMenu] = useState(null);
+      /*
+       * Inline rename / create box inside a preset menu (v0.4).
+       *
+       * Why not window.prompt: this UI runs inside Electron, where `prompt` is
+       * not implemented — it logs a warning and returns null, so the old code
+       * hit `if (next === null) return` and did nothing. That is exactly the
+       * "点了没反应" report. An in-app input also gets focus management, Escape
+       * and validation for free.
+       *
+       * Shape: { mode: 'rename' | 'create', slot: string, value: string } | null
+       * `slot` is '' when creating, because the id does not exist yet.
+       */
+      const [presetEdit, setPresetEdit] = useState(null);
       const [picker, setPicker] = useState(null);
       const [drag, setDrag] = useState(null);
       const [editing, setEditing] = useState(null);
@@ -1362,9 +1397,19 @@ window.__ModuleLoader__.load({
         };
       }, [pluginRows, presetScope]);
 
-      /** Name a slot for display: its custom name, else the slot number. */
+      /**
+       * Name a preset for display: its custom name, else its position.
+       *
+       * v0.4: the fallback is the 1-based position in the current preset order,
+       * not a hard-coded mapping from p1/p2. The position is a display detail
+       * only — the id stays stable, so reordering or deleting never breaks a
+       * saved preset.
+       */
       function presetLabel(preset, slot) {
-        return preset?.name ? `预设「${preset.name}」` : `预设 ${slot === 'p1' ? '1' : '2'}`;
+        if (preset?.name) return `预设「${preset.name}」`;
+        const ids = Object.keys(layout.presets ?? {});
+        const at = ids.indexOf(slot);
+        return `预设 ${at >= 0 ? at + 1 : '?'}`;
       }
 
       /** Rename one slot (empty clears back to the default label). */
@@ -1381,6 +1426,118 @@ window.__ModuleLoader__.load({
           };
         });
       }, [applyLayout]);
+
+      /**
+       * Create a preset from the CURRENT state (v0.4).
+       *
+       * Creating from what is on screen is what makes the button useful right
+       * away: click it, name it, and you have a third preset that matches how
+       * things look now. An empty husk would only be a slot to fill later, which
+       * is what "存为预设" already does for an existing preset.
+       *
+       * Returns the new id so the caller can immediately open its rename box.
+       */
+      const createPreset = useCallback((name) => {
+        const snap = snapshotOf();
+        const count = Object.keys(snap.states).length;
+        if (count === 0 && snap.groups.length === 0) {
+          setNotice({ kind: 'warn', text: '现在没有可保存的内容，预设没创建。' });
+          return null;
+        }
+        const id = newPresetId(layout.presets);
+        applyLayout((prev) => ({
+          ...prev,
+          presets: {
+            ...(prev.presets ?? {}),
+            [id]: {
+              name: String(name ?? '').trim().slice(0, 20),
+              at: new Date().toISOString(),
+              ...snap,
+            },
+          },
+        }));
+        const onCount = Object.values(snap.states).filter(Boolean).length;
+        setNotice({
+          kind: 'ok',
+          text: `已新建预设 ${Object.keys(layout.presets ?? {}).length + 1}：`
+            + `${onCount}/${count} 个插件开着 · ${snap.groups.length} 个分组。`,
+        });
+        return id;
+      }, [applyLayout, layout.presets, snapshotOf]);
+
+      /** Delete a preset. The plugins it describes are NOT touched. */
+      const deletePreset = useCallback((slot) => {
+        const id = String(slot ?? '');
+        if (!id) return;
+        applyLayout((prev) => {
+          const next = { ...(prev.presets ?? {}) };
+          delete next[id];
+          return { ...prev, presets: next };
+        });
+        setNotice({ kind: 'ok', text: '预设已删除。插件开关和分组没有变动。' });
+      }, [applyLayout]);
+
+      /**
+       * The inline name box, shared by "rename one" and "create one".
+       *
+       * Rendered inside `.pgv-menu-wrap`, which is the subtree the
+       * outside-click handler ignores — so typing into it does not close the
+       * menu on the first mousedown.
+       */
+      function presetEditRow() {
+        if (!presetEdit) return null;
+        // ⚠️ 变量名不能叫 editing —— 组件里已有一个 editing 是「分组改名」用的，
+        //    同名会在闭包里遮蔽掉那个，改分组名字时会读到预设的草稿。
+        const box = presetEdit;
+        const commit = () => {
+          if (box.mode === 'create') {
+            const id = createPreset(box.value);
+            setPresetEdit(null);
+            if (id) setPresetMenu(null);
+            return;
+          }
+          renamePreset(box.slot, box.value);
+          setPresetEdit(null);
+          setPresetMenu(null);
+        };
+        return h('div', { key: 'edit', className: 'pgv-menu-edit' }, [
+          h('input', {
+            key: 'in',
+            className: 'pgv-input pgv-menu-editinput',
+            value: box.value,
+            autoFocus: true,
+            maxLength: 20,
+            placeholder: box.mode === 'create'
+              ? '给新预设起个名字（可留空）'
+              : '新名字（留空恢复默认）',
+            onChange: (event) => setPresetEdit({ ...box, value: event.target.value }),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') { event.preventDefault(); commit(); }
+              if (event.key === 'Escape') { event.preventDefault(); setPresetEdit(null); }
+            },
+          }),
+          h('button', { key: 'ok', type: 'button', className: 'pgv-menu-editok', onClick: commit }, '确定'),
+          h('button', {
+            key: 'no', type: 'button', className: 'pgv-menu-editcancel',
+            onClick: () => setPresetEdit(null),
+          }, '取消'),
+        ]);
+      }
+
+      /** One "＋ 新建预设" row, the last line of both preset menus. */
+      function presetCreateRow() {
+        if (presetEdit?.mode === 'create') return presetEditRow();
+        return h('button', {
+          key: 'new',
+          type: 'button',
+          className: 'pgv-menu-item pgv-menu-new',
+          title: '把现在的开关状态和分组存成一个新预设，可以存任意多个',
+          onClick: () => setPresetEdit({ mode: 'create', slot: '', value: '' }),
+        }, [
+          h('span', { key: 'n', className: 'pgv-menu-label' }, '＋ 新建预设'),
+          h('span', { key: 's', className: 'pgv-menu-sub' }, '存当前状态'),
+        ]);
+      }
 
       const addGroup = useCallback(() => {
         const id = `g${Date.now().toString(36)}`;
@@ -2329,28 +2486,34 @@ window.__ModuleLoader__.load({
             className: 'pgv-btn' + (presetMenu === 'save' ? ' is-open' : ''),
             title: '把现在的开关状态和分组存成一个快照，之后可以一键恢复',
             disabled: Boolean(applying),
-            onClick: () => setPresetMenu(presetMenu === 'save' ? null : 'save'),
+            onClick: () => { setPresetEdit(null); setPresetMenu(presetMenu === 'save' ? null : 'save'); },
           }, [
             h('span', { key: 'g', className: 'pgv-btn-glyph' }, '💾'),
             h('span', { key: 'l' }, '存为预设'),
           ]),
           presetMenu === 'save'
-            ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
-              const preset = (layout.presets ?? {})[slot];
-              const savedOn = Object.values(preset?.states ?? {}).filter(Boolean).length;
-              return h('button', {
-                key: slot, type: 'button', className: 'pgv-menu-item',
-                title: preset
-                  ? `覆盖保存：现在是 ${(layout.groups ?? []).length} 个分组，槽位里存的是 ${savedOn} 开、${(preset.groups ?? []).length} 个分组`
-                  : '这个槽位还空着',
-                onClick: () => { savePreset(slot); setPresetMenu(null); },
-              }, [
-                h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
-                h('span', { key: 's', className: 'pgv-menu-sub' }, preset
-                  ? `${savedOn} 开 · ${(preset.groups ?? []).length} 组`
-                  : '空'),
-              ]);
-            }))
+            ? h('div', { key: 'menu', className: 'pgv-menu' }, [
+              ...Object.keys(layout.presets ?? {}).map((slot) => {
+                const preset = (layout.presets ?? {})[slot];
+                const savedOn = Object.values(preset?.states ?? {}).filter(Boolean).length;
+                return h('button', {
+                  key: slot, type: 'button', className: 'pgv-menu-item',
+                  title: `覆盖保存：现在是 ${(layout.groups ?? []).length} 个分组，`
+                    + `这份预设里存的是 ${savedOn} 开、${(preset.groups ?? []).length} 个分组`,
+                  onClick: () => { savePreset(slot); setPresetMenu(null); },
+                }, [
+                  h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
+                  h('span', { key: 's', className: 'pgv-menu-sub' },
+                    `${savedOn} 开 · ${(preset.groups ?? []).length} 组`),
+                ]);
+              }),
+              // No presets at all yet: point at the create row rather than
+              // showing an empty box, which reads like a bug.
+              Object.keys(layout.presets ?? {}).length === 0
+                ? h('div', { key: 'none', className: 'pgv-menu-hint' }, '还没有预设，用下面这行新建一个。')
+                : null,
+              presetCreateRow(),
+            ])
             : null,
         ]),
         h('div', { key: 'presetApply', className: 'pgv-menu-wrap' }, [
@@ -2359,63 +2522,78 @@ window.__ModuleLoader__.load({
             className: 'pgv-btn' + (presetMenu === 'apply' ? ' is-open' : ''),
             title: '把开关和分组恢复成某个预设里存的样子',
             disabled: Boolean(applying),
-            onClick: () => setPresetMenu(presetMenu === 'apply' ? null : 'apply'),
+            onClick: () => { setPresetEdit(null); setPresetMenu(presetMenu === 'apply' ? null : 'apply'); },
           }, [
             h('span', { key: 'g', className: 'pgv-btn-glyph' }, '⚡'),
             h('span', { key: 'l' }, applying ? `恢复中 ${applying.done}/${applying.total}` : '恢复预设'),
           ]),
           presetMenu === 'apply'
-            ? h('div', { key: 'menu', className: 'pgv-menu' }, PRESET_SLOTS.map((slot) => {
-              const preset = (layout.presets ?? {})[slot];
-              const impact = presetImpact(preset);
-              return h('div', { key: slot, className: 'pgv-menu-row' }, [
-                h('button', {
-                  key: 'go', type: 'button',
-                  className: 'pgv-menu-item' + (preset ? '' : ' is-empty'),
-                  disabled: !preset,
-                  /*
-                   * The label says how much this click changes, not just which
-                   * slot it is. "恢复 预设1" is a promise; "8组 · 36插件 · 改12处开关"
-                   * is measurable, and the difference matters when a click both
-                   * flips a dozen switches and rewrites the whole grouping.
-                   */
-                  title: preset
-                    ? [
-                      `用来恢复：会改 ${impact.switches} 个插件开关、${impact.components} 个组件`,
-                      impact.groups === null ? '（这份预设没有存分组）' : `分组换成预设里的 ${impact.groups} 个`,
-                      `备注 ${impact.notes} 条 · 标签 ${impact.tags} 组`,
-                    ].join('\n')
-                    : '这个槽位还没存过东西',
-                  onClick: () => {
-                    setPresetMenu(null);
-                    applyPreset(slot);
-                  },
-                }, [
-                  h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
-                  h('span', { key: 's', className: 'pgv-menu-sub' }, preset
-                    ? [
-                      impact.switches > 0 ? `改${impact.switches}开关` : '开关一致',
-                      impact.groups === null ? null : `${impact.groups}组`,
-                    ].filter(Boolean).join(' · ')
-                    : '空'),
-                ]),
-                // Renaming lives here rather than in the save menu: the save menu
-                // writes, and mixing "overwrite this slot" with "rename this slot"
-                // in one list is how you rename the wrong one by accident.
-                preset
-                  ? h('button', {
-                    key: 'rn', type: 'button', className: 'pgv-menu-rename',
-                    title: '给这个预设起个名字，比如「干活模式」',
-                    onClick: () => {
-                      const next = window.prompt('给这个预设起个名字（留空恢复默认）', preset.name ?? '');
-                      if (next === null) return;
-                      renamePreset(slot, next);
-                      setPresetMenu(null);
-                    },
-                  }, '改名')
-                  : null,
-              ]);
-            }))
+            ? h('div', { key: 'menu', className: 'pgv-menu' }, [
+              ...Object.keys(layout.presets ?? {}).map((slot) => {
+                const preset = (layout.presets ?? {})[slot];
+                const impact = presetImpact(preset);
+                // Renaming swaps the whole row for the inline box, so the list
+                // never shows a stale label next to the field editing it.
+                const isRenaming = presetEdit?.mode === 'rename' && presetEdit.slot === slot;
+                return h('div', { key: slot, className: 'pgv-menu-rowwrap' }, [
+                  isRenaming
+                    ? presetEditRow()
+                    : h('div', { key: 'row', className: 'pgv-menu-row' }, [
+                      h('button', {
+                        key: 'go', type: 'button',
+                        className: 'pgv-menu-item',
+                        /*
+                         * The label says how much this click changes, not just
+                         * which preset it is. "恢复 预设1" is a promise;
+                         * "改12开关 · 8组" is measurable, and the difference
+                         * matters when one click flips a dozen switches and
+                         * rewrites the whole grouping.
+                         */
+                        title: [
+                          `用来恢复：会改 ${impact.switches} 个插件开关、${impact.components} 个组件`,
+                          impact.groups === null ? '（这份预设没有存分组）' : `分组换成预设里的 ${impact.groups} 个`,
+                          `备注 ${impact.notes} 条 · 标签 ${impact.tags} 组`,
+                        ].join('\n'),
+                        onClick: () => {
+                          setPresetMenu(null);
+                          applyPreset(slot);
+                        },
+                      }, [
+                        h('span', { key: 'n', className: 'pgv-menu-label' }, presetLabel(preset, slot)),
+                        h('span', { key: 's', className: 'pgv-menu-sub' }, [
+                          impact.switches > 0 ? `改${impact.switches}开关` : '开关一致',
+                          impact.groups === null ? null : `${impact.groups}组`,
+                        ].filter(Boolean).join(' · ')),
+                      ]),
+                      /*
+                       * Rename lives in this menu rather than the save menu: the
+                       * save menu writes, and mixing "overwrite this preset" with
+                       * "rename this preset" in one list is how you rename the
+                       * wrong one by accident.
+                       */
+                      h('button', {
+                        key: 'rn', type: 'button', className: 'pgv-menu-rename',
+                        title: '给这个预设起个名字，比如「干活模式」',
+                        onClick: () => setPresetEdit({
+                          mode: 'rename', slot, value: preset?.name ?? '',
+                        }),
+                      }, '改名'),
+                      h('button', {
+                        key: 'del', type: 'button', className: 'pgv-menu-del',
+                        title: '删除这个预设（插件开关和分组不会动）',
+                        onClick: () => {
+                          if (!window.confirm(`删除${presetLabel(preset, slot)}？\n插件开关和分组不会变动。`)) return;
+                          deletePreset(slot);
+                        },
+                      }, '✕'),
+                    ]),
+                ]);
+              }),
+              Object.keys(layout.presets ?? {}).length === 0
+                ? h('div', { key: 'none', className: 'pgv-menu-hint' }, '还没有预设，用下面这行新建一个。')
+                : null,
+              presetCreateRow(),
+            ])
             : null,
         ]),
         h('span', { key: 'grow', className: 'pgv-grow' }),
@@ -2865,6 +3043,55 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-primary);
   border-color: var(--dsw-alias-border-l2);
 }
+/* v0.4: unlimited presets need a delete affordance per row. */
+.pgv-menu-rowwrap { display: block; }
+.pgv-menu-del {
+  flex: 0 0 auto;
+  font: inherit; font-size: 11px; cursor: pointer;
+  padding: 6px 8px; border-radius: 6px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent; border: 1px solid var(--dsw-alias-border-l1);
+}
+.pgv-menu-del:hover {
+  color: var(--dsw-alias-state-error-primary, #e05252);
+  border-color: var(--dsw-alias-state-error-primary, #e05252);
+}
+/* The last line of both menus: create a preset. */
+.pgv-menu-new {
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  margin-top: 4px; padding-top: 10px;
+  border-radius: 0 0 7px 7px;
+}
+.pgv-menu-hint {
+  padding: 6px 10px 2px;
+  font-size: 11.5px; line-height: 1.6;
+  color: var(--dsw-alias-label-secondary);
+}
+/* Inline name box, replacing window.prompt (unsupported in Electron). */
+.pgv-menu-edit { display: flex; align-items: center; gap: 4px; }
+.pgv-menu-editinput {
+  flex: 1 1 auto; min-width: 0;
+  font: inherit; font-size: 12.5px;
+  padding: 7px 9px; border-radius: 7px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-brand-primary);
+  outline: none;
+}
+.pgv-menu-editok,
+.pgv-menu-editcancel {
+  flex: 0 0 auto;
+  font: inherit; font-size: 11.5px; cursor: pointer;
+  padding: 6px 9px; border-radius: 6px;
+  background: transparent; border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+}
+.pgv-menu-editok {
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-brand-primary);
+}
+.pgv-menu-editok:hover { background: var(--dsw-alias-bg-layer-2); }
+.pgv-menu-editcancel:hover { color: var(--dsw-alias-label-primary); }
 /*
  * The group's component-level health dot. Same three hues as the ratio, plus a
  * neutral one for a group that is simply switched off. Colour is never the only
