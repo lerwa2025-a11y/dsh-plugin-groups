@@ -785,6 +785,25 @@ window.__ModuleLoader__.load({
       );
 
       /**
+       * Members of every locked group.
+       *
+       * A lock means "this roster stays as it is", so it has to hold against
+       * every way a plugin can be moved — the group's own "add" picker, a drag,
+       * the ungrouped "assign to" menu. Filtering on the *target* group alone is
+       * what used to let a locked group be emptied: the move was legal because
+       * the destination was unlocked, and the removal from the locked source
+       * was never checked. This set is the source side of that check.
+       */
+      const lockedGroupMembers = useMemo(() => {
+        const set = new Set();
+        for (const group of groups) {
+          if (!group.locked) continue;
+          for (const member of group.members ?? []) set.add(member);
+        }
+        return set;
+      }, [groups]);
+
+      /**
        * Reconcile a bundle against the live component rows.
        *
        * A bundle that reports `enabled: true` can still have pieces that never
@@ -1565,11 +1584,20 @@ window.__ModuleLoader__.load({
       }, [applyLayout]);
 
       const removeGroup = useCallback((id) => {
-        applyLayout((prev) => ({
-          ...prev,
-          groups: (prev.groups ?? []).filter((group) => group.id !== id),
-          order: (prev.order ?? []).filter((x) => x !== id),
-        }));
+        applyLayout((prev) => {
+          /*
+           * Deleting a locked group would also dump its members into
+           * 未分组 — a membership change wearing a different hat. The header
+           * button is already disabled, so this is the second guard.
+           */
+          const target = (prev.groups ?? []).find((group) => group.id === id);
+          if (!target || target.locked) return prev;
+          return {
+            ...prev,
+            groups: (prev.groups ?? []).filter((group) => group.id !== id),
+            order: (prev.order ?? []).filter((x) => x !== id),
+          };
+        });
         setOpenGroups((prev) => {
           if (!prev[id]) return prev;
           const next = { ...prev };
@@ -1769,7 +1797,34 @@ window.__ModuleLoader__.load({
       }, [searching, listed.length, visibleUngrouped.length, groups, groupedNames,
         bundleByName, bundleMatches, needle]);
 
+      /**
+       * The locked group that currently owns `bundleName`, or null.
+       *
+       * Used to refuse a move instead of silently doing it, and to say which
+       * group's lock is in the way — "nothing happened" with no explanation
+       * reads as a broken button.
+       */
+      const lockedOwnerOf = useCallback((bundleName) => (
+        groups.find((group) => group.locked && (group.members ?? []).includes(bundleName)) ?? null
+      ), [groups]);
+
       const assignTo = useCallback((groupId, bundleName) => {
+        // The source side of the lock: a locked group's roster may not be
+        // raided by assigning its members somewhere else.
+        const owner = lockedOwnerOf(bundleName);
+        if (owner) {
+          // Already where it belongs: nothing to do, and no need to warn.
+          if (owner.id === groupId) {
+            setPicker(null);
+            return;
+          }
+          setNotice({
+            kind: 'warn',
+            text: `「${bundleName}」在已锁定的分组「${owner.name}」里，锁定期间不能被移到别的分组。要调整请先解锁。`,
+          });
+          setPicker(null);
+          return;
+        }
         applyLayout((prev) => {
           const target = (prev.groups ?? []).find((group) => group.id === groupId);
           // A locked group refuses new members, like any other structural change.
@@ -1785,9 +1840,19 @@ window.__ModuleLoader__.load({
           };
         });
         setPicker(null);
-      }, [applyLayout]);
+      }, [applyLayout, lockedOwnerOf]);
 
       const removeFrom = useCallback((groupId, bundleName) => {
+        // The row hides this control in a locked group, so reaching here means
+        // a stale render or a direct call. The lock still holds.
+        const owner = lockedOwnerOf(bundleName);
+        if (owner) {
+          setNotice({
+            kind: 'warn',
+            text: `「${bundleName}」在已锁定的分组「${owner.name}」里，不能移出。要调整请先解锁。`,
+          });
+          return;
+        }
         applyLayout((prev) => ({
           ...prev,
           groups: (prev.groups ?? []).map((group) => (
@@ -1796,12 +1861,28 @@ window.__ModuleLoader__.load({
               : group
           )),
         }));
-      }, [applyLayout]);
+      }, [applyLayout, lockedOwnerOf]);
 
       /** Drop a dragged member onto another member: reorder, or move across groups. */
       const dropMemberOn = useCallback((targetGroupId, targetName) => {
         if (!drag || drag.kind !== 'member') return;
+        // Same source-side guard as assignTo: a drag must not empty a locked
+        // group either. Reordering inside the only locked group cannot happen
+        // because its rows are not draggable, so any hit here is a cross-group
+        // move out of a locked group.
+        const owner = lockedOwnerOf(drag.name);
+        if (owner) {
+          setNotice({
+            kind: 'warn',
+            text: `「${drag.name}」在已锁定的分组「${owner.name}」里，锁定期间不能拖动到别处。要调整请先解锁。`,
+          });
+          return;
+        }
         applyLayout((prev) => {
+          const targetLocked = (prev.groups ?? []).find((group) => group.id === targetGroupId)?.locked;
+          // The destination refuses new members too, matching every other
+          // structural change in a locked group.
+          if (targetLocked) return prev;
           const groupsNext = (prev.groups ?? []).map((group) => ({
             ...group,
             members: (group.members ?? []).filter((member) => member !== drag.name),
@@ -1812,7 +1893,7 @@ window.__ModuleLoader__.load({
           target.members.splice(at < 0 ? target.members.length : at, 0, drag.name);
           return { ...prev, groups: groupsNext };
         });
-      }, [applyLayout, drag]);
+      }, [applyLayout, drag, lockedOwnerOf]);
 
       const dropOnGroup = useCallback((groupId) => {
         if (!drag) return;
@@ -2367,7 +2448,16 @@ window.__ModuleLoader__.load({
 
           picker === group.id
             ? h('div', { key: 'picker', className: 'pgv-picker' }, (() => {
-              const candidates = assignable.filter((bundle) => !(group.members ?? []).includes(bundle.name));
+              /*
+               * Two exclusions, for two different reasons:
+               *   - already a member here: adding it again is a no-op;
+               *   - a member of ANOTHER locked group: offering it would silently
+               *     fail now that a move honours the source group's lock, and an
+               *     option that cannot work should not be shown at all.
+               */
+              const candidates = assignable.filter((bundle) => (
+                !(group.members ?? []).includes(bundle.name) && !lockedGroupMembers.has(bundle.name)
+              ));
               if (candidates.length === 0) {
                 return [h('span', { key: 'none', className: 'pgv-hint' }, '没有可添加的插件了')];
               }
